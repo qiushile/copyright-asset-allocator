@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Database
+*.db
+*.db-wal
+*.db-shm
+
+# Scan results (generated at runtime)
+copyright/inventory/*.db
+copyright/inventory/*.csv
+copyright/inventory/*.json
+copyright/inventory/*.txt
+
+# Allocation results (generated at runtime)
+copyright/allocations/*.txt
+copyright/allocations/*.json
+
+# Workspaces (generated at runtime)
+copyright/workspaces/*/source/
+copyright/workspaces/*/SOURCE_MANIFEST.json
+copyright/workspaces/*/PROJECT_CONTEXT.md
+
+# Output materials (generated at runtime)
+copyright/outputs/*/
+copyright/outputs/*.json
+copyright/outputs/*.txt
+
+# Keep config
+!copyright/config/copyrights.yaml.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

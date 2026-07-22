@@ -1,0 +1,47 @@
+# 软著配置文件 - 测试用
+# 使用 hermes-agent 仓库模拟两个软著
+
+snapshot:
+  repository: hermes-agent
+  created_at: "2026-07-22"
+
+policies:
+  path_overlap: forbidden
+  exact_content_overlap: forbidden
+  copied_code_detection: enabled
+  unallocated_file_access: forbidden
+  shared_file_policy: excluded
+  generated_code_policy: excluded
+  third_party_code_policy: excluded
+
+copyrights:
+  - id: core-agent
+    name: 智能代理核心系统
+    version: V1.0
+    description: AI代理核心调度、工具执行和会话管理系统
+    include_paths:
+      - agent/**
+      - core/**
+    exclude_paths:
+      - plugins/**
+      - tests/**
+      - docs/**
+      - scripts/**
+      - vendor/**
+      - node_modules/**
+
+  - id: plugin-system
+    name: 插件扩展管理系统
+    version: V1.0
+    description: 插件加载、注册、生命周期管理和扩展接口系统
+    include_paths:
+      - plugins/**
+      - extensions/**
+    exclude_paths:
+      - agent/**
+      - core/**
+      - tests/**
+      - docs/**
+      - scripts/**
+      - vendor/**
+      - node_modules/**

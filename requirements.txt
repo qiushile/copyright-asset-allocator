@@ -1,0 +1,14 @@
+# Copyright Asset Allocation System - Dependencies
+
+# Database (built-in with Python)
+# sqlite3 is part of Python standard library
+
+# Configuration
+PyYAML>=6.0
+
+# DOCX generation
+python-docx>=1.1.0
+
+# Optional: Code parsing for better function extraction
+# tree-sitter>=0.20.0
+# tree-sitter-languages>=1.7.0
