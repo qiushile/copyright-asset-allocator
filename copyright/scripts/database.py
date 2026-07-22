@@ -221,6 +221,16 @@ def init_database():
             )
         """)
         
+        # 项目设置表（存储时间过滤等全局配置）
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS project_settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT NOT NULL UNIQUE,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
         # 索引
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_files_commit ON files(commit_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_files_path ON files(file_path)")
@@ -401,6 +411,78 @@ def get_team_eligible_file_ids(commit_id: int) -> Optional[set]:
         """, (commit_id,))
         if cursor.fetchone()[0] == 0:
             return None  # 未执行分析
+        cursor.execute("""
+            SELECT file_id FROM file_team_stats
+            WHERE commit_id = ? AND is_eligible = 1
+        """, (commit_id,))
+        return set(row[0] for row in cursor.fetchall())
+
+
+def set_project_setting(key: str, value: str):
+    """Set a project-level setting."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO project_settings (key, value, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+        """, (key, value))
+
+
+def get_project_setting(key: str) -> Optional[str]:
+    """Get a project-level setting."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM project_settings WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+
+def set_since_date(date_str: str):
+    """Set the time cutoff date for code eligibility."""
+    set_project_setting('since_date', date_str)
+
+
+def get_since_date() -> Optional[str]:
+    """Get the time cutoff date."""
+    return get_project_setting('since_date')
+
+
+def get_since_timestamp() -> Optional[int]:
+    """Get the time cutoff as Unix timestamp. Returns None if not set."""
+    date_str = get_since_date()
+    if not date_str:
+        return None
+    from datetime import datetime
+    try:
+        # Support multiple formats
+        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%Y-%m'):
+            try:
+                dt = datetime.strptime(date_str, fmt)
+                return int(dt.timestamp())
+            except ValueError:
+                continue
+        return None
+    except Exception:
+        return None
+
+
+def get_time_eligible_file_ids(commit_id: int) -> Optional[set]:
+    """Get file IDs eligible by time filter. Returns None if no time filter set."""
+    since_ts = get_since_timestamp()
+    if since_ts is None:
+        return None
+    
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        # Check if time analysis has been done
+        cursor.execute("""
+            SELECT COUNT(*) FROM file_team_stats WHERE commit_id = ?
+        """, (commit_id,))
+        if cursor.fetchone()[0] == 0:
+            return None  # Analysis not done yet
+        
+        # Get files where time-eligible lines >= 50%
         cursor.execute("""
             SELECT file_id FROM file_team_stats
             WHERE commit_id = ? AND is_eligible = 1

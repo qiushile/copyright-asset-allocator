@@ -390,11 +390,24 @@ def cmd_ownership(args):
         repo_path = Path(args.repo_path) if args.repo_path else Path(scan_result.get('repo_path', '.'))
         commit_hash = args.commit_hash if args.commit_hash else scan_result.get('commit_hash', 'HEAD')
         
+        # Handle --since parameter
+        from database import set_since_date, get_since_timestamp
+        since_timestamp = None
+        if hasattr(args, 'since') and args.since:
+            set_since_date(args.since)
+            since_timestamp = get_since_timestamp()
+            if since_timestamp is None:
+                print(f"Error: Invalid date format: {args.since}")
+                sys.exit(1)
+        else:
+            since_timestamp = get_since_timestamp()
+        
         results = analyze_repository_ownership(
             commit_id=scan_result['commit_id'],
             repo_path=repo_path,
             commit_hash=commit_hash,
             team_emails=team_emails,
+            since_timestamp=since_timestamp,
             verbose=args.verbose,
         )
         
@@ -412,6 +425,48 @@ def cmd_ownership(args):
             print(f"\n  Authors:")
             for a in report['authors'][:10]:
                 print(f"    {a['name']} <{a['email']}>: {a['total_lines']} lines, {a['file_count']} files")
+
+
+
+# ============================================================
+# Time Filter: Set Since Date
+# ============================================================
+
+def cmd_set_since(args):
+    """Set or show the time cutoff for code eligibility."""
+    from database import init_database, set_since_date, get_since_date, get_since_timestamp
+    from datetime import datetime
+    
+    init_database()
+    
+    if args.action == 'set':
+        date_str = args.date
+        # Validate date format
+        set_since_date(date_str)
+        ts = get_since_timestamp()
+        if ts is None:
+            print(f"Error: Invalid date format: {date_str}")
+            print("Supported: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, YYYY/MM/DD, YYYY-MM")
+            sys.exit(1)
+        dt = datetime.fromtimestamp(ts)
+        print(f"Time filter set: only code after {dt.strftime('%Y-%m-%d %H:%M:%S')} is eligible")
+        print(f"  (Stored: {date_str})")
+        print(f"\nNext: run 'ownership analyze' to re-evaluate file eligibility")
+    
+    elif args.action == 'show':
+        date_str = get_since_date()
+        if date_str:
+            ts = get_since_timestamp()
+            dt = datetime.fromtimestamp(ts) if ts else None
+            print(f"Current time filter: {date_str}")
+            if dt:
+                print(f"  Parsed as: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+        else:
+            print("No time filter set. All code is eligible regardless of date.")
+    
+    elif args.action == 'clear':
+        set_since_date('')
+        print("Time filter cleared. All code is now eligible regardless of date.")
 
 
 # ============================================================
@@ -494,6 +549,7 @@ Commands:
   audit       Final audit before submission
   mark-used   [Feature 1] Mark code used in previous copyrights
   ownership   [Feature 2] Analyze code ownership (git blame)
+  set-since   [Feature 4] Set time cutoff for code eligibility
   auto-split  [Feature 3] Auto-split code into multiple copyrights
 
 Example workflow:
@@ -505,6 +561,10 @@ Example workflow:
   
   # (Optional) Feature 2: Team ownership analysis
   python copyright_cli.py ownership add-member --name "Zhang" --email "zhang@team.com"
+  python copyright_cli.py ownership analyze --repo-path /path/to/repo
+  
+  # (Optional) Feature 4: Time filter - only code after a date
+  python copyright_cli.py set-since set 2025-01-01
   python copyright_cli.py ownership analyze --repo-path /path/to/repo
   
   # (Option A) Manual allocation with config
@@ -618,7 +678,19 @@ Example workflow:
     analyze_parser = ownership_sub.add_parser('analyze', help='Run ownership analysis')
     analyze_parser.add_argument('--repo-path', help='Path to git repository')
     analyze_parser.add_argument('--commit-hash', help='Commit hash (default: from scan)')
+    analyze_parser.add_argument('--since', help='Only code after this date (YYYY-MM-DD)')
     analyze_parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
+    
+    # set-since (Time Filter)
+    set_since_parser = subparsers.add_parser('set-since',
+        help='Set time cutoff: only code after this date is eligible')
+    set_since_sub = set_since_parser.add_subparsers(dest='action')
+    
+    since_set_parser = set_since_sub.add_parser('set', help='Set the cutoff date')
+    since_set_parser.add_argument('date', help='Cutoff date (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)')
+    
+    set_since_sub.add_parser('show', help='Show current time filter')
+    set_since_sub.add_parser('clear', help='Clear time filter')
     
     # auto-split (Feature 3)
     auto_split_parser = subparsers.add_parser('auto-split',
@@ -663,14 +735,17 @@ Example workflow:
         'audit': cmd_audit,
         'mark-used': cmd_mark_used,
         'ownership': cmd_ownership,
+        'set-since': cmd_set_since,
         'auto-split': cmd_auto_split,
     }
     
-    if args.command in ('mark-used', 'ownership') and not getattr(args, 'action', None):
+    if args.command in ('mark-used', 'ownership', 'set-since') and not getattr(args, 'action', None):
         if args.command == 'mark-used':
             mark_used_parser.print_help()
-        else:
+        elif args.command == 'ownership':
             ownership_parser.print_help()
+        else:
+            set_since_parser.print_help()
         sys.exit(1)
     
     commands[args.command](args)
