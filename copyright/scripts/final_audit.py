@@ -23,9 +23,6 @@ def audit_commit(commit_id: int, workspaces_dir: Path) -> dict:
     5. All files in manifest exist
     6. No files outside manifest in workspace
     """
-    conn = get_connection()
-    cursor = conn.cursor()
-    
     results = {
         'passed': True,
         'errors': [],
@@ -33,136 +30,137 @@ def audit_commit(commit_id: int, workspaces_dir: Path) -> dict:
         'copyrights': [],
     }
     
-    # 获取所有软著
-    cursor.execute("""
-        SELECT id, copyright_id, name, version, status
-        FROM copyrights
-        WHERE commit_id = ?
-    """, (commit_id,))
-    
-    copyrights = cursor.fetchall()
-    
-    # 收集所有分配的文件路径
-    all_paths = {}  # path -> copyright_id
-    all_hashes = {}  # sha256 -> [(copyright_id, path)]
-    
-    for cr_db_id, cr_id, cr_name, cr_version, cr_status in copyrights:
-        cr_result = {
-            'copyright_id': cr_id,
-            'name': cr_name,
-            'version': cr_version,
-            'status': cr_status,
-            'file_count': 0,
-            'total_lines': 0,
-            'workspace_exists': False,
-            'manifest_valid': False,
-        }
+    with get_connection() as conn:
+        cursor = conn.cursor()
         
-        # 获取分配的文件
+        # 获取所有软著
         cursor.execute("""
-            SELECT f.file_path, f.sha256, f.effective_lines
-            FROM files f
-            JOIN allocations a ON f.id = a.file_id
-            WHERE a.commit_id = ? AND a.copyright_id = ?
-        """, (commit_id, cr_db_id))
+            SELECT id, copyright_id, name, version, status
+            FROM copyrights
+            WHERE commit_id = ?
+        """, (commit_id,))
         
-        files = cursor.fetchall()
-        cr_result['file_count'] = len(files)
-        cr_result['total_lines'] = sum(f[2] for f in files)
+        copyrights = cursor.fetchall()
         
-        # 检查路径重复
-        for file_path, sha256, _ in files:
-            if file_path in all_paths:
-                results['passed'] = False
-                results['errors'].append({
-                    'type': 'path_overlap',
-                    'file': file_path,
-                    'copyright_1': all_paths[file_path],
-                    'copyright_2': cr_id,
-                    'message': f'File {file_path} allocated to both {all_paths[file_path]} and {cr_id}'
-                })
-            else:
-                all_paths[file_path] = cr_id
+        # 收集所有分配的文件路径
+        all_paths = {}  # path -> copyright_id
+        all_hashes = {}  # sha256 -> [(copyright_id, path)]
+        
+        for cr_db_id, cr_id, cr_name, cr_version, cr_status in copyrights:
+            cr_result = {
+                'copyright_id': cr_id,
+                'name': cr_name,
+                'version': cr_version,
+                'status': cr_status,
+                'file_count': 0,
+                'total_lines': 0,
+                'workspace_exists': False,
+                'manifest_valid': False,
+            }
             
-            # 收集哈希
-            if sha256 not in all_hashes:
-                all_hashes[sha256] = []
-            all_hashes[sha256].append((cr_id, file_path))
-        
-        # 检查工作区
-        workspace_dir = workspaces_dir / cr_id
-        manifest_path = workspace_dir / 'SOURCE_MANIFEST.json'
-        
-        if workspace_dir.exists():
-            cr_result['workspace_exists'] = True
+            # 获取分配的文件
+            cursor.execute("""
+                SELECT f.file_path, f.sha256, f.effective_lines
+                FROM files f
+                JOIN allocations a ON f.id = a.file_id
+                WHERE a.commit_id = ? AND a.copyright_id = ?
+            """, (commit_id, cr_db_id))
             
-            if manifest_path.exists():
-                cr_result['manifest_valid'] = True
+            files = cursor.fetchall()
+            cr_result['file_count'] = len(files)
+            cr_result['total_lines'] = sum(f[2] for f in files)
+            
+            # 检查路径重复
+            for file_path, sha256, _ in files:
+                if file_path in all_paths:
+                    results['passed'] = False
+                    results['errors'].append({
+                        'type': 'path_overlap',
+                        'file': file_path,
+                        'copyright_1': all_paths[file_path],
+                        'copyright_2': cr_id,
+                        'message': f'File {file_path} allocated to both {all_paths[file_path]} and {cr_id}'
+                    })
+                else:
+                    all_paths[file_path] = cr_id
                 
-                with open(manifest_path, 'r', encoding='utf-8') as f:
-                    manifest = json.load(f)
+                # 收集哈希
+                if sha256 not in all_hashes:
+                    all_hashes[sha256] = []
+                all_hashes[sha256].append((cr_id, file_path))
+            
+            # 检查工作区
+            workspace_dir = workspaces_dir / cr_id
+            manifest_path = workspace_dir / 'SOURCE_MANIFEST.json'
+            
+            if workspace_dir.exists():
+                cr_result['workspace_exists'] = True
                 
-                # 检查 manifest 中的文件数量
-                if manifest['totalFiles'] != len(files):
+                if manifest_path.exists():
+                    cr_result['manifest_valid'] = True
+                    
+                    with open(manifest_path, 'r', encoding='utf-8') as f:
+                        manifest = json.load(f)
+                    
+                    # 检查 manifest 中的文件数量
+                    if manifest['totalFiles'] != len(files):
+                        results['warnings'].append({
+                            'type': 'file_count_mismatch',
+                            'copyright_id': cr_id,
+                            'manifest_count': manifest['totalFiles'],
+                            'db_count': len(files),
+                            'message': f'{cr_id}: manifest has {manifest["totalFiles"]} files, DB has {len(files)}'
+                        })
+                    
+                    # 检查 commit 一致性
+                    cursor.execute("SELECT commit_hash FROM commits WHERE id = ?", (commit_id,))
+                    expected_commit = cursor.fetchone()[0]
+                    
+                    if manifest['repositoryCommit'] != expected_commit:
+                        results['passed'] = False
+                        results['errors'].append({
+                            'type': 'commit_mismatch',
+                            'copyright_id': cr_id,
+                            'manifest_commit': manifest['repositoryCommit'],
+                            'expected_commit': expected_commit,
+                            'message': f'{cr_id}: manifest commit mismatch'
+                        })
+                    
+                    # 检查软件名称一致性
+                    if manifest['softwareName'] != cr_name:
+                        results['passed'] = False
+                        results['errors'].append({
+                            'type': 'name_mismatch',
+                            'copyright_id': cr_id,
+                            'manifest_name': manifest['softwareName'],
+                            'db_name': cr_name,
+                            'message': f'{cr_id}: software name mismatch'
+                        })
+                    
+                    # 检查版本一致性
+                    if manifest['version'] != cr_version:
+                        results['passed'] = False
+                        results['errors'].append({
+                            'type': 'version_mismatch',
+                            'copyright_id': cr_id,
+                            'manifest_version': manifest['version'],
+                            'db_version': cr_version,
+                            'message': f'{cr_id}: version mismatch'
+                        })
+                else:
                     results['warnings'].append({
-                        'type': 'file_count_mismatch',
+                        'type': 'missing_manifest',
                         'copyright_id': cr_id,
-                        'manifest_count': manifest['totalFiles'],
-                        'db_count': len(files),
-                        'message': f'{cr_id}: manifest has {manifest["totalFiles"]} files, DB has {len(files)}'
-                    })
-                
-                # 检查 commit 一致性
-                cursor.execute("SELECT commit_hash FROM commits WHERE id = ?", (commit_id,))
-                expected_commit = cursor.fetchone()[0]
-                
-                if manifest['repositoryCommit'] != expected_commit:
-                    results['passed'] = False
-                    results['errors'].append({
-                        'type': 'commit_mismatch',
-                        'copyright_id': cr_id,
-                        'manifest_commit': manifest['repositoryCommit'],
-                        'expected_commit': expected_commit,
-                        'message': f'{cr_id}: manifest commit mismatch'
-                    })
-                
-                # 检查软件名称一致性
-                if manifest['softwareName'] != cr_name:
-                    results['passed'] = False
-                    results['errors'].append({
-                        'type': 'name_mismatch',
-                        'copyright_id': cr_id,
-                        'manifest_name': manifest['softwareName'],
-                        'db_name': cr_name,
-                        'message': f'{cr_id}: software name mismatch'
-                    })
-                
-                # 检查版本一致性
-                if manifest['version'] != cr_version:
-                    results['passed'] = False
-                    results['errors'].append({
-                        'type': 'version_mismatch',
-                        'copyright_id': cr_id,
-                        'manifest_version': manifest['version'],
-                        'db_version': cr_version,
-                        'message': f'{cr_id}: version mismatch'
+                        'message': f'{cr_id}: workspace exists but manifest missing'
                     })
             else:
                 results['warnings'].append({
-                    'type': 'missing_manifest',
+                    'type': 'missing_workspace',
                     'copyright_id': cr_id,
-                    'message': f'{cr_id}: workspace exists but manifest missing'
+                    'message': f'{cr_id}: workspace not built'
                 })
-        else:
-            results['warnings'].append({
-                'type': 'missing_workspace',
-                'copyright_id': cr_id,
-                'message': f'{cr_id}: workspace not built'
-            })
-        
-        results['copyrights'].append(cr_result)
-    
-    conn.close()
+            
+            results['copyrights'].append(cr_result)
     
     # 检查完全相同文件（不同路径但相同哈希）
     for sha256, file_list in all_hashes.items():

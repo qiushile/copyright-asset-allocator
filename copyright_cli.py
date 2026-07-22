@@ -42,13 +42,26 @@ def cmd_init(args):
 
 def cmd_scan(args):
     """Scan repository."""
-    from scan_repository import scan_repository, export_inventory
+    from scan_repository import scan_repository, export_inventory, validate_repo_path
     
-    result = scan_repository(
-        repo_path=Path(args.repo_path),
-        commit_hash=args.commit,
-        verbose=args.verbose
-    )
+    repo_path = Path(args.repo_path)
+    
+    # 验证仓库路径
+    try:
+        validate_repo_path(repo_path)
+    except (FileNotFoundError, NotADirectoryError, ValueError) as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    
+    try:
+        result = scan_repository(
+            repo_path=repo_path,
+            commit_hash=args.commit,
+            verbose=args.verbose
+        )
+    except Exception as e:
+        print(f"Error during scan: {e}")
+        sys.exit(1)
     
     export_inventory(result, Path('copyright/inventory'))
     
@@ -81,18 +94,26 @@ def cmd_allocate(args):
     
     config = load_config(config_path)
     
+    if 'copyrights' not in config or not config['copyrights']:
+        print("Error: No copyrights defined in config file.")
+        sys.exit(1)
+    
     # 执行分配
     results = allocate_files_from_config(
         commit_id=scan_result['commit_id'],
         files=scan_result['files'],
         copyrights_config=config['copyrights'],
-        verbose=args.verbose
+        verbose=args.verbose,
+        force=args.force
     )
     
     # 导出结果
     export_allocations(results, Path('copyright/allocations'), config['copyrights'])
     
     print(f"\nAllocation complete:")
+    if results.get('reallocated'):
+        print("  (Re-allocation: cleared previous assignments)")
+    
     for cr_id, files in results['allocations'].items():
         cr_name = next(c['name'] for c in config['copyrights'] if c['id'] == cr_id)
         total_lines = sum(f['effective_lines'] for f in files)
@@ -100,6 +121,11 @@ def cmd_allocate(args):
     
     if results['unallocated']:
         print(f"\n  Unallocated: {len(results['unallocated'])} files")
+    
+    if results['conflicts']:
+        print(f"\n  Conflicts: {len(results['conflicts'])} files (already allocated)")
+        if not args.force:
+            print("  Tip: Use --force to clear and re-allocate")
 
 
 def cmd_validate(args):
@@ -122,6 +148,14 @@ def cmd_validate(args):
     print(f"\nValidation: {'PASSED ✓' if results['valid'] else 'FAILED ✗'}")
     print(f"  Errors: {len(results['errors'])}")
     print(f"  Warnings: {len(results['warnings'])}")
+    
+    if results['errors']:
+        for err in results['errors']:
+            print(f"  ✗ [{err['type']}] {err['message']}")
+    
+    if args.verbose and results['warnings']:
+        for warn in results['warnings']:
+            print(f"  ⚠ [{warn['type']}] {warn['message']}")
 
 
 def cmd_workspace(args):
@@ -138,18 +172,28 @@ def cmd_workspace(args):
     with open(scan_result_path, 'r', encoding='utf-8') as f:
         scan_result = json.load(f)
     
-    result = build_workspace(
-        commit_id=scan_result['commit_id'],
-        copyright_id=args.copyright_id,
-        output_base=Path('copyright/workspaces'),
-        verify_hashes=not args.no_verify,
-        verbose=args.verbose
-    )
+    try:
+        result = build_workspace(
+            commit_id=scan_result['commit_id'],
+            copyright_id=args.copyright_id,
+            output_base=Path('copyright/workspaces'),
+            verify_hashes=not args.no_verify,
+            verbose=args.verbose
+        )
+    except ValueError as e:
+        print(f"Error: {e}")
+        print("Available copyrights can be found in copyright/allocations/allocation-summary.json")
+        sys.exit(1)
     
     print(f"\nWorkspace built: {result['workspace_dir']}")
     print(f"  Status: {result['status']}")
     print(f"  Files: {result['total_files']}")
     print(f"  Lines: {result['total_effective_lines']}")
+    
+    if result['errors']:
+        print(f"  Errors: {len(result['errors'])}")
+        for err in result['errors'][:5]:
+            print(f"    - {err['file']}: {err['error']}")
 
 
 def cmd_detect(args):
@@ -157,7 +201,7 @@ def cmd_detect(args):
     from detect_duplicates import detect_duplicates, save_report
     import json
     
-    # 获取信息
+    # 获取 commit_id 和 repo_path
     scan_result_path = Path('copyright/inventory/scan-result.json')
     if not scan_result_path.exists():
         print("Error: scan-result.json not found. Run 'scan' first.")
@@ -168,23 +212,37 @@ def cmd_detect(args):
     
     # 获取仓库路径
     from database import get_connection
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT r.path FROM repositories r
-        JOIN commits c ON r.id = c.repository_id
-        WHERE c.id = ?
-    """, (scan_result['commit_id'],))
-    repo_path = cursor.fetchone()[0]
-    conn.close()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT r.path FROM commits c
+            JOIN repositories r ON c.repository_id = r.id
+            WHERE c.id = ?
+        """, (scan_result['commit_id'],))
+        row = cursor.fetchone()
     
-    report = detect_duplicates(scan_result['commit_id'], Path(repo_path))
+    if not row:
+        print("Error: Repository path not found in database.")
+        sys.exit(1)
+    
+    repo_path = Path(row[0])
+    if not repo_path.exists():
+        print(f"Error: Repository path no longer exists: {repo_path}")
+        sys.exit(1)
+    
+    report = detect_duplicates(scan_result['commit_id'], repo_path)
     save_report(report, Path('copyright/inventory/duplicate-report.json'))
     
     print(f"\nDuplicate detection complete:")
     print(f"  Path overlaps: {report['summary']['total_path_overlaps']}")
     print(f"  Exact file overlaps: {report['summary']['total_exact_overlaps']}")
     print(f"  Similar code pairs: {report['summary']['total_similar_pairs']}")
+    
+    if report['summary']['total_path_overlaps'] > 0 or report['summary']['total_exact_overlaps'] > 0:
+        print("\n❌ CRITICAL: Path or exact file overlaps detected!")
+        sys.exit(1)
+    elif report['summary']['total_similar_pairs'] > 0:
+        print("\n⚠️  WARNING: Similar code blocks detected, manual review recommended")
 
 
 def cmd_generate(args):
@@ -196,22 +254,25 @@ def cmd_generate(args):
     
     if not workspace_dir.exists():
         print(f"Error: Workspace not found: {workspace_dir}")
-        print("Run 'workspace' command first.")
+        print(f"Run 'workspace {args.copyright_id}' first.")
         sys.exit(1)
     
-    # 加载 manifest
     manifest_path = workspace_dir / 'SOURCE_MANIFEST.json'
+    if not manifest_path.exists():
+        print(f"Error: Manifest not found in workspace: {manifest_path}")
+        print(f"Run 'workspace {args.copyright_id}' first.")
+        sys.exit(1)
+    
     with open(manifest_path, 'r', encoding='utf-8') as f:
         manifest = json.load(f)
     
+    software_name = manifest['softwareName']
+    version = manifest['version']
     output_dir = Path('copyright/outputs') / args.copyright_id
     
-    generate_code_material(
-        workspace_dir=workspace_dir,
-        output_dir=output_dir,
-        software_name=manifest['softwareName'],
-        version=manifest['version'],
-    )
+    print(f"Generating code materials for: {software_name} {version}")
+    
+    generate_code_material(workspace_dir, output_dir, software_name, version)
 
 
 def cmd_audit(args):
@@ -234,6 +295,14 @@ def cmd_audit(args):
     print(f"\nFinal Audit: {'PASSED ✓' if results['passed'] else 'FAILED ✗'}")
     print(f"  Errors: {len(results['errors'])}")
     print(f"  Warnings: {len(results['warnings'])}")
+    
+    if results['errors']:
+        for err in results['errors']:
+            print(f"  ✗ [{err['type']}] {err['message']}")
+    
+    if args.verbose and results['warnings']:
+        for warn in results['warnings']:
+            print(f"  ⚠ [{warn['type']}] {warn['message']}")
 
 
 def main():
@@ -266,8 +335,6 @@ Example workflow:
         """
     )
     
-    parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
-    
     subparsers = parser.add_subparsers(dest='command', help='Command to run')
     
     # init
@@ -277,38 +344,51 @@ Example workflow:
     scan_parser = subparsers.add_parser('scan', help='Scan Git repository')
     scan_parser.add_argument('repo_path', help='Path to Git repository')
     scan_parser.add_argument('--commit', help='Specific commit hash (default: HEAD)')
+    scan_parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     
     # allocate
     allocate_parser = subparsers.add_parser('allocate', help='Allocate files to copyrights')
     allocate_parser.add_argument('--config', default='copyright/config/copyrights.yaml',
                                 help='Path to copyrights.yaml')
+    allocate_parser.add_argument('--force', action='store_true',
+                                help='Clear existing allocations and re-allocate')
+    allocate_parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     
     # validate
     validate_parser = subparsers.add_parser('validate', help='Validate allocations')
     validate_parser.add_argument('--min-lines', type=int, default=3000,
                                  help='Minimum lines per copyright')
+    validate_parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     
     # workspace
     workspace_parser = subparsers.add_parser('workspace', help='Build workspace')
     workspace_parser.add_argument('copyright_id', help='Copyright ID')
     workspace_parser.add_argument('--no-verify', action='store_true',
                                   help='Skip hash verification')
+    workspace_parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     
     # detect
-    subparsers.add_parser('detect', help='Detect code duplication')
+    detect_parser = subparsers.add_parser('detect', help='Detect code duplication')
+    detect_parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     
     # generate
     generate_parser = subparsers.add_parser('generate', help='Generate DOCX materials')
     generate_parser.add_argument('copyright_id', help='Copyright ID')
+    generate_parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     
     # audit
-    subparsers.add_parser('audit', help='Final audit')
+    audit_parser = subparsers.add_parser('audit', help='Final audit')
+    audit_parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     
     args = parser.parse_args()
     
     if not args.command:
         parser.print_help()
         sys.exit(1)
+    
+    # 确保 verbose 属性存在
+    if not hasattr(args, 'verbose'):
+        args.verbose = False
     
     # 路由到对应命令
     commands = {

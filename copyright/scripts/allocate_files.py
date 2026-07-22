@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from database import (
     init_database, get_connection, allocate_file,
-    check_file_allocated, get_allocation
+    check_file_allocated, get_allocation, clear_allocations
 )
 
 
@@ -67,46 +67,55 @@ def should_include_file(file_path: str, include_paths: list, exclude_paths: list
 
 
 def create_copyright(commit_id: int, copyright_id: str, name: str, version: str, description: str) -> int:
-    """Create copyright record in database."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        INSERT INTO copyrights (commit_id, copyright_id, name, version, description)
-        VALUES (?, ?, ?, ?, ?)
-    """, (commit_id, copyright_id, name, version, description))
-    
-    copyright_db_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    
-    return copyright_db_id
+    """Create copyright record in database (idempotent)."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        
+        # 先检查是否已存在
+        cursor.execute("""
+            SELECT id FROM copyrights
+            WHERE commit_id = ? AND copyright_id = ?
+        """, (commit_id, copyright_id))
+        row = cursor.fetchone()
+        if row:
+            # 更新已有记录
+            cursor.execute("""
+                UPDATE copyrights SET name = ?, version = ?, description = ?
+                WHERE commit_id = ? AND copyright_id = ?
+            """, (name, version, description, commit_id, copyright_id))
+            return row[0]
+        
+        cursor.execute("""
+            INSERT INTO copyrights (commit_id, copyright_id, name, version, description)
+            VALUES (?, ?, ?, ?, ?)
+        """, (commit_id, copyright_id, name, version, description))
+        return cursor.lastrowid
 
 
 def get_copyright_db_id(commit_id: int, copyright_id: str) -> Optional[int]:
     """Get database ID for copyright."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT id FROM copyrights
-        WHERE commit_id = ? AND copyright_id = ?
-    """, (commit_id, copyright_id))
-    
-    row = cursor.fetchone()
-    conn.close()
-    
-    return row[0] if row else None
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id FROM copyrights
+            WHERE commit_id = ? AND copyright_id = ?
+        """, (commit_id, copyright_id))
+        row = cursor.fetchone()
+        return row[0] if row else None
 
 
 def allocate_files_from_config(
     commit_id: int,
     files: list,
     copyrights_config: list,
-    verbose: bool = False
+    verbose: bool = False,
+    force: bool = False
 ) -> dict:
     """
     Allocate files to copyrights based on configuration.
+    
+    Args:
+        force: If True, clear existing allocations first (re-allocation).
     
     Returns:
         dict with allocation results and conflicts
@@ -116,23 +125,27 @@ def allocate_files_from_config(
         'unallocated': [],
         'conflicts': [],
         'excluded': [],
+        'reallocated': False,
     }
+    
+    # 如果 force 模式，清除已有分配
+    if force:
+        clear_allocations(commit_id)
+        results['reallocated'] = True
+        if verbose:
+            print("Cleared existing allocations for re-allocation")
     
     # 为每个软著创建记录
     copyright_db_ids = {}
     for cr_config in copyrights_config:
         cr_id = cr_config['id']
-        db_id = get_copyright_db_id(commit_id, cr_id)
-        
-        if db_id is None:
-            db_id = create_copyright(
-                commit_id=commit_id,
-                copyright_id=cr_id,
-                name=cr_config['name'],
-                version=cr_config['version'],
-                description=cr_config.get('description', '')
-            )
-        
+        db_id = create_copyright(
+            commit_id=commit_id,
+            copyright_id=cr_id,
+            name=cr_config['name'],
+            version=cr_config['version'],
+            description=cr_config.get('description', '')
+        )
         copyright_db_ids[cr_id] = db_id
         results['allocations'][cr_id] = []
     
@@ -147,7 +160,7 @@ def allocate_files_from_config(
             results['conflicts'].append({
                 'file': file_path,
                 'file_id': file_id,
-                'reason': f'already_allocated_to_{existing_cr}'
+                'reason': f'already_allocated_to_copyright_id_{existing_cr}'
             })
             continue
         
@@ -171,18 +184,17 @@ def allocate_files_from_config(
                         'effective_lines': file['effective_lines'],
                     })
                     allocated = True
-                    
                     if verbose:
                         print(f"  {file_path} -> {cr_id}")
                 else:
                     results['conflicts'].append({
                         'file': file_path,
                         'file_id': file_id,
-                        'reason': 'allocation_failed'
+                        'reason': f'allocation_failed_for_{cr_id}'
                     })
                 break
         
-        if not allocated:
+        if not allocated and not any(c['file'] == file_path for c in results['conflicts']):
             results['unallocated'].append({
                 'file_id': file_id,
                 'path': file_path,
@@ -240,6 +252,7 @@ def export_allocations(results: dict, output_dir: Path, copyrights_config: list)
             'total_allocated': sum(len(files) for files in results['allocations'].values()),
             'total_unallocated': len(results['unallocated']),
             'total_conflicts': len(results['conflicts']),
+            'reallocated': results.get('reallocated', False),
             'by_copyright': {
                 cr_id: {
                     'name': next(c['name'] for c in copyrights_config if c['id'] == cr_id),
@@ -260,6 +273,8 @@ def main():
                        help='Path to scan result JSON')
     parser.add_argument('--output', type=Path, default=Path('copyright/allocations'),
                        help='Output directory for allocation files')
+    parser.add_argument('--force', action='store_true',
+                       help='Clear existing allocations and re-allocate')
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     
     args = parser.parse_args()
@@ -289,7 +304,7 @@ def main():
     
     # 执行分配
     copyrights_config = config['copyrights']
-    results = allocate_files_from_config(commit_id, files, copyrights_config, args.verbose)
+    results = allocate_files_from_config(commit_id, files, copyrights_config, args.verbose, args.force)
     
     # 导出结果
     export_allocations(results, args.output, copyrights_config)

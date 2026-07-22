@@ -21,9 +21,6 @@ def validate_allocations(commit_id: int, min_lines_per_copyright: int = 3000) ->
     3. No unallocated source files (warning)
     4. File hashes match scan
     """
-    conn = get_connection()
-    cursor = conn.cursor()
-    
     results = {
         'valid': True,
         'errors': [],
@@ -31,99 +28,90 @@ def validate_allocations(commit_id: int, min_lines_per_copyright: int = 3000) ->
         'stats': {},
     }
     
-    # 1. 检查重复分配（数据库唯一约束已保证，但再次验证）
-    cursor.execute("""
-        SELECT file_id, COUNT(*) as cnt
-        FROM allocations
-        WHERE commit_id = ?
-        GROUP BY file_id
-        HAVING cnt > 1
-    """, (commit_id,))
-    
-    duplicates = cursor.fetchall()
-    if duplicates:
-        results['valid'] = False
-        results['errors'].append({
-            'type': 'duplicate_allocation',
-            'message': f'{len(duplicates)} files allocated to multiple copyrights',
-            'files': [row[0] for row in duplicates]
-        })
-    
-    # 2. 检查每个软著的代码量
-    cursor.execute("""
-        SELECT c.id, c.copyright_id, c.name, c.version,
-               COUNT(f.id) as file_count,
-               COALESCE(SUM(f.effective_lines), 0) as total_lines
-        FROM copyrights c
-        LEFT JOIN allocations a ON c.id = a.copyright_id AND a.commit_id = ?
-        LEFT JOIN files f ON a.file_id = f.id AND f.commit_id = ?
-        WHERE c.commit_id = ?
-        GROUP BY c.id
-    """, (commit_id, commit_id, commit_id))
-    
-    copyrights_stats = []
-    for row in cursor.fetchall():
-        cr_db_id, cr_id, name, version, file_count, total_lines = row
+    with get_connection() as conn:
+        cursor = conn.cursor()
         
-        stat = {
-            'copyright_id': cr_id,
-            'name': name,
-            'version': version,
-            'file_count': file_count,
-            'total_lines': total_lines,
-        }
-        copyrights_stats.append(stat)
+        # 1. 检查重复分配（数据库唯一约束已保证，但再次验证）
+        cursor.execute("""
+            SELECT file_id, COUNT(*) as cnt
+            FROM allocations
+            WHERE commit_id = ?
+            GROUP BY file_id
+            HAVING cnt > 1
+        """, (commit_id,))
         
-        if file_count == 0:
+        duplicates = cursor.fetchall()
+        if duplicates:
             results['valid'] = False
             results['errors'].append({
-                'type': 'no_files',
-                'copyright_id': cr_id,
-                'message': f'{name} has no files allocated'
+                'type': 'duplicate_allocation',
+                'message': f'{len(duplicates)} files allocated to multiple copyrights',
+                'files': [row[0] for row in duplicates]
             })
-        elif total_lines < min_lines_per_copyright:
+        
+        # 2. 检查每个软著的代码量
+        cursor.execute("""
+            SELECT c.id, c.copyright_id, c.name, c.version,
+                   COUNT(f.id) as file_count,
+                   COALESCE(SUM(f.effective_lines), 0) as total_lines
+            FROM copyrights c
+            LEFT JOIN allocations a ON c.id = a.copyright_id AND a.commit_id = ?
+            LEFT JOIN files f ON a.file_id = f.id AND f.commit_id = ?
+            WHERE c.commit_id = ?
+            GROUP BY c.id
+        """, (commit_id, commit_id, commit_id))
+        
+        copyrights_stats = []
+        for row in cursor.fetchall():
+            cr_db_id, cr_id, name, version, file_count, total_lines = row
+            
+            stat = {
+                'copyright_id': cr_id,
+                'name': name,
+                'version': version,
+                'file_count': file_count,
+                'total_lines': total_lines,
+            }
+            copyrights_stats.append(stat)
+            
+            if file_count == 0:
+                results['valid'] = False
+                results['errors'].append({
+                    'type': 'no_files',
+                    'copyright_id': cr_id,
+                    'message': f'{name} has no files allocated'
+                })
+            elif total_lines < min_lines_per_copyright:
+                results['warnings'].append({
+                    'type': 'low_line_count',
+                    'copyright_id': cr_id,
+                    'message': f'{name} has only {total_lines} effective lines (recommended: {min_lines_per_copyright}+)',
+                    'lines': total_lines,
+                    'threshold': min_lines_per_copyright,
+                })
+        
+        results['stats']['copyrights'] = copyrights_stats
+        
+        # 3. 检查未分配的源文件
+        cursor.execute("""
+            SELECT f.id, f.file_path, f.language, f.effective_lines
+            FROM files f
+            LEFT JOIN allocations a ON f.id = a.file_id AND a.commit_id = ?
+            LEFT JOIN excluded_files e ON f.id = e.file_id AND e.commit_id = ?
+            WHERE f.commit_id = ?
+              AND a.id IS NULL
+              AND e.id IS NULL
+              AND f.effective_lines > 10
+        """, (commit_id, commit_id, commit_id))
+        
+        unallocated = cursor.fetchall()
+        if unallocated:
             results['warnings'].append({
-                'type': 'low_line_count',
-                'copyright_id': cr_id,
-                'message': f'{name} has only {total_lines} effective lines (recommended: {min_lines_per_copyright}+)',
-                'lines': total_lines,
-                'threshold': min_lines_per_copyright,
+                'type': 'unallocated_files',
+                'message': f'{len(unallocated)} source files not allocated to any copyright',
+                'count': len(unallocated),
+                'files': [{'id': r[0], 'path': r[1], 'language': r[2], 'lines': r[3]} for r in unallocated[:20]]
             })
-    
-    results['stats']['copyrights'] = copyrights_stats
-    
-    # 3. 检查未分配的源文件
-    cursor.execute("""
-        SELECT f.id, f.file_path, f.language, f.effective_lines
-        FROM files f
-        LEFT JOIN allocations a ON f.id = a.file_id AND a.commit_id = ?
-        LEFT JOIN excluded_files e ON f.id = e.file_id AND e.commit_id = ?
-        WHERE f.commit_id = ?
-          AND a.id IS NULL
-          AND e.id IS NULL
-          AND f.effective_lines > 10
-    """, (commit_id, commit_id, commit_id))
-    
-    unallocated = cursor.fetchall()
-    if unallocated:
-        results['warnings'].append({
-            'type': 'unallocated_files',
-            'message': f'{len(unallocated)} source files not allocated to any copyright',
-            'count': len(unallocated),
-            'files': [{'id': r[0], 'path': r[1], 'language': r[2], 'lines': r[3]} for r in unallocated[:20]]
-        })
-    
-    # 4. 检查文件哈希一致性（分配后文件不应被修改）
-    cursor.execute("""
-        SELECT f.id, f.file_path, f.sha256
-        FROM files f
-        JOIN allocations a ON f.id = a.file_id
-        WHERE a.commit_id = ?
-    """, (commit_id,))
-    
-    # 这里只记录，实际验证需要在 build_workspace 时做
-    
-    conn.close()
     
     return results
 

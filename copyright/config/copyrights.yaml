@@ -1,0 +1,39 @@
+# 软著配置文件 - 测试用
+# 使用 test-copyright-repo 仓库模拟两个软著
+
+snapshot:
+  repository: test-copyright-repo
+  created_at: "2026-07-22"
+
+policies:
+  path_overlap: forbidden
+  exact_content_overlap: forbidden
+  copied_code_detection: enabled
+  unallocated_file_access: forbidden
+  shared_file_policy: excluded
+  generated_code_policy: excluded
+  third_party_code_policy: excluded
+
+copyrights:
+  - id: collector
+    name: 实时数据采集与传输系统
+    version: V1.0
+    description: 接收TCP数据、完成报文解密并发送至Kafka
+    include_paths:
+      - services/collector/**
+      - libs/protocol-common/**
+    exclude_paths:
+      - services/parser/**
+      - shared/**
+      - tests/**
+
+  - id: parser
+    name: 数据解析与标准化处理系统
+    version: V1.0
+    description: 消费原始Kafka消息并完成协议解析和字段标准化
+    include_paths:
+      - services/parser/**
+    exclude_paths:
+      - services/collector/**
+      - shared/**
+      - tests/**

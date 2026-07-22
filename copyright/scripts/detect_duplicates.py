@@ -27,14 +27,13 @@ def normalize_code(code: str) -> str:
     return '\n'.join(lines)
 
 
-def tokenize_code(code: str) -> list[str]:
+def tokenize_code(code: str) -> list:
     """Simple tokenization: split by whitespace and operators."""
-    # 简单的 token 化：按空白和标点分割
     tokens = re.findall(r'[a-zA-Z_]\w*|[0-9]+(?:\.[0-9]+)?|[^\s\w]', code)
     return tokens
 
 
-def extract_functions(code: str, language: str) -> list[dict]:
+def extract_functions(code: str, language: str) -> list:
     """Extract function-level code blocks."""
     functions = []
     
@@ -45,7 +44,6 @@ def extract_functions(code: str, language: str) -> list[dict]:
         
         for i, match in enumerate(matches):
             start = match.start()
-            # 找到匹配的结束大括号
             brace_count = 0
             end = start
             for j, char in enumerate(code[start:], start):
@@ -71,7 +69,6 @@ def extract_functions(code: str, language: str) -> list[dict]:
         
         for i, match in enumerate(matches):
             start = match.start()
-            # 找到下一个 def 或文件结尾
             if i + 1 < len(matches):
                 end = matches[i + 1].start()
             else:
@@ -91,12 +88,11 @@ def compute_function_fingerprint(func_code: str) -> str:
     """Compute fingerprint for a function."""
     normalized = normalize_code(func_code)
     tokens = tokenize_code(normalized)
-    # 使用 token 序列的哈希作为指纹
-    token_str = '|'.join(tokens[:100])  # 取前100个token
+    token_str = '|'.join(tokens[:100])
     return hashlib.md5(token_str.encode()).hexdigest()
 
 
-def detect_path_overlap(files_by_copyright: dict) -> list[dict]:
+def detect_path_overlap(files_by_copyright: dict) -> list:
     """Level 1: Detect path overlap."""
     overlaps = []
     copyright_ids = list(files_by_copyright.keys())
@@ -122,10 +118,9 @@ def detect_path_overlap(files_by_copyright: dict) -> list[dict]:
     return overlaps
 
 
-def detect_exact_file_overlap(files_by_copyright: dict) -> list[dict]:
+def detect_exact_file_overlap(files_by_copyright: dict) -> list:
     """Level 2: Detect exact file content overlap (same SHA-256)."""
     overlaps = []
-    copyright_ids = list(files_by_copyright.keys())
     
     # 构建哈希到文件的映射
     hash_to_files = defaultdict(list)
@@ -150,17 +145,16 @@ def detect_exact_file_overlap(files_by_copyright: dict) -> list[dict]:
     return overlaps
 
 
-def detect_similar_code(files_by_copyright: dict, repo_path: Path) -> list[dict]:
-    """Level 3: Detect similar code blocks (function-level)."""
-    overlaps = []
+def detect_similar_code(files_by_copyright: dict, repo_path: Path) -> list:
+    """Level 3: Detect similar code blocks between copyrights."""
+    similar_pairs = []
     copyright_ids = list(files_by_copyright.keys())
     
     # 为每个软著提取函数指纹
-    fingerprints_by_cr = {}
+    fingerprints_by_copyright = {}
     
     for cr_id, files in files_by_copyright.items():
-        fingerprints = []
-        
+        fingerprints = {}
         for file in files:
             file_path = repo_path / file['path']
             if not file_path.exists():
@@ -168,105 +162,99 @@ def detect_similar_code(files_by_copyright: dict, repo_path: Path) -> list[dict]
             
             try:
                 code = file_path.read_text(encoding='utf-8', errors='ignore')
-                functions = extract_functions(code, file['language'])
-                
-                for func in functions:
-                    if func['lines'] >= 5:  # 只考虑5行以上的函数
-                        fp = compute_function_fingerprint(func['code'])
-                        fingerprints.append({
-                            'file': file['path'],
-                            'function': func['name'],
-                            'fingerprint': fp,
-                            'lines': func['lines'],
-                        })
             except Exception:
                 continue
+            
+            functions = extract_functions(code, file['language'])
+            for func in functions:
+                if func['lines'] < 5:  # 忽略太短的函数
+                    continue
+                fp = compute_function_fingerprint(func['code'])
+                fingerprints[fp] = {
+                    'file': file['path'],
+                    'function': func['name'],
+                    'lines': func['lines'],
+                }
         
-        fingerprints_by_cr[cr_id] = fingerprints
+        fingerprints_by_copyright[cr_id] = fingerprints
     
-    # 比较不同软著之间的函数指纹
+    # 比较不同软著间的指纹
     for i in range(len(copyright_ids)):
         for j in range(i + 1, len(copyright_ids)):
             cr1 = copyright_ids[i]
             cr2 = copyright_ids[j]
             
-            fps1 = {fp['fingerprint']: fp for fp in fingerprints_by_cr[cr1]}
-            fps2 = {fp['fingerprint']: fp for fp in fingerprints_by_cr[cr2]}
+            fps1 = fingerprints_by_copyright.get(cr1, {})
+            fps2 = fingerprints_by_copyright.get(cr2, {})
             
             common_fps = set(fps1.keys()) & set(fps2.keys())
             
             if common_fps:
                 similar_functions = []
-                total_similar_lines = 0
-                max_block_lines = 0
+                total_lines = 0
+                max_lines = 0
                 
                 for fp in common_fps:
-                    func1 = fps1[fp]
-                    func2 = fps2[fp]
+                    f1 = fps1[fp]
+                    f2 = fps2[fp]
                     similar_functions.append({
-                        'function_1': f"{func1['file']}::{func1['function']}",
-                        'function_2': f"{func2['file']}::{func2['function']}",
-                        'lines': func1['lines'],
+                        'function_1': f"{f1['file']}::{f1['function']}",
+                        'function_2': f"{f2['file']}::{f2['function']}",
+                        'lines': max(f1['lines'], f2['lines']),
                     })
-                    total_similar_lines += func1['lines']
-                    max_block_lines = max(max_block_lines, func1['lines'])
+                    total_lines += max(f1['lines'], f2['lines'])
+                    max_lines = max(max_lines, f1['lines'], f2['lines'])
                 
                 # 计算相似度
-                total_lines_1 = sum(fp['lines'] for fp in fingerprints_by_cr[cr1])
-                total_lines_2 = sum(fp['lines'] for fp in fingerprints_by_cr[cr2])
-                avg_total = (total_lines_1 + total_lines_2) / 2 if (total_lines_1 + total_lines_2) > 0 else 1
-                similarity_ratio = total_similar_lines / avg_total if avg_total > 0 else 0
+                total_funcs = max(len(fps1), len(fps2), 1)
+                similarity_ratio = len(common_fps) / total_funcs
                 
-                overlaps.append({
+                similar_pairs.append({
                     'copyright_1': cr1,
                     'copyright_2': cr2,
                     'type': 'similar_code',
                     'similar_function_count': len(common_fps),
-                    'similar_functions': similar_functions,
-                    'total_similar_lines': total_similar_lines,
-                    'max_similar_block_lines': max_block_lines,
-                    'similarity_ratio': round(similarity_ratio, 4),
+                    'total_similar_lines': total_lines,
+                    'max_similar_block_lines': max_lines,
+                    'similarity_ratio': similarity_ratio,
+                    'similar_functions': similar_functions[:10],
                 })
     
-    return overlaps
+    return similar_pairs
 
 
 def detect_duplicates(commit_id: int, repo_path: Path) -> dict:
     """Run all three levels of duplicate detection."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    # 获取所有软著
-    cursor.execute("""
-        SELECT id, copyright_id, name FROM copyrights WHERE commit_id = ?
-    """, (commit_id,))
-    
-    copyrights = cursor.fetchall()
-    
-    # 获取每个软著的文件
+    # 获取所有软著的文件
     files_by_copyright = {}
     
-    for cr_db_id, cr_id, cr_name in copyrights:
-        cursor.execute("""
-            SELECT f.id, f.file_path, f.sha256, f.language, f.effective_lines
-            FROM files f
-            JOIN allocations a ON f.id = a.file_id
-            WHERE a.commit_id = ? AND a.copyright_id = ?
-        """, (commit_id, cr_db_id))
+    with get_connection() as conn:
+        cursor = conn.cursor()
         
-        files = cursor.fetchall()
-        files_by_copyright[cr_id] = [
-            {
-                'id': f[0],
-                'path': f[1],
-                'sha256': f[2],
-                'language': f[3],
-                'effective_lines': f[4],
-            }
-            for f in files
-        ]
-    
-    conn.close()
+        cursor.execute("""
+            SELECT id, copyright_id FROM copyrights WHERE commit_id = ?
+        """, (commit_id,))
+        copyrights = cursor.fetchall()
+        
+        for cr_db_id, cr_id in copyrights:
+            cursor.execute("""
+                SELECT f.id, f.file_path, f.sha256, f.language, f.effective_lines
+                FROM files f
+                JOIN allocations a ON f.id = a.file_id
+                WHERE a.commit_id = ? AND a.copyright_id = ?
+            """, (commit_id, cr_db_id))
+            
+            files = cursor.fetchall()
+            files_by_copyright[cr_id] = [
+                {
+                    'id': f[0],
+                    'path': f[1],
+                    'sha256': f[2],
+                    'language': f[3],
+                    'effective_lines': f[4],
+                }
+                for f in files
+            ]
     
     # 执行三级检测
     path_overlaps = detect_path_overlap(files_by_copyright)

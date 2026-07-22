@@ -5,7 +5,6 @@ import argparse
 import hashlib
 import json
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -16,18 +15,15 @@ from database import init_database, get_connection
 
 def get_repository_info(commit_id: int) -> dict:
     """Get repository path and commit hash."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT r.path, r.name, c.commit_hash
-        FROM commits c
-        JOIN repositories r ON c.repository_id = r.id
-        WHERE c.id = ?
-    """, (commit_id,))
-    
-    row = cursor.fetchone()
-    conn.close()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT r.path, r.name, c.commit_hash
+            FROM commits c
+            JOIN repositories r ON c.repository_id = r.id
+            WHERE c.id = ?
+        """, (commit_id,))
+        row = cursor.fetchone()
     
     if not row:
         raise ValueError(f"Commit ID {commit_id} not found")
@@ -41,20 +37,17 @@ def get_repository_info(commit_id: int) -> dict:
 
 def get_copyright_info(commit_id: int, copyright_id: str) -> dict:
     """Get copyright metadata."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT id, name, version, description
-        FROM copyrights
-        WHERE commit_id = ? AND copyright_id = ?
-    """, (commit_id, copyright_id))
-    
-    row = cursor.fetchone()
-    conn.close()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, name, version, description
+            FROM copyrights
+            WHERE commit_id = ? AND copyright_id = ?
+        """, (commit_id, copyright_id))
+        row = cursor.fetchone()
     
     if not row:
-        raise ValueError(f"Copyright {copyright_id} not found for commit {commit_id}")
+        raise ValueError(f"Copyright '{copyright_id}' not found for commit {commit_id}")
     
     return {
         'db_id': row[0],
@@ -66,19 +59,16 @@ def get_copyright_info(commit_id: int, copyright_id: str) -> dict:
 
 def get_allocated_files(commit_id: int, copyright_db_id: int) -> list:
     """Get all files allocated to a copyright."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT f.id, f.file_path, f.sha256, f.language, f.effective_lines, f.total_lines
-        FROM files f
-        JOIN allocations a ON f.id = a.file_id
-        WHERE a.commit_id = ? AND a.copyright_id = ?
-        ORDER BY f.file_path
-    """, (commit_id, copyright_db_id))
-    
-    files = cursor.fetchall()
-    conn.close()
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT f.id, f.file_path, f.sha256, f.language, f.effective_lines, f.total_lines
+            FROM files f
+            JOIN allocations a ON f.id = a.file_id
+            WHERE a.commit_id = ? AND a.copyright_id = ?
+            ORDER BY f.file_path
+        """, (commit_id, copyright_db_id))
+        files = cursor.fetchall()
     
     return [
         {
@@ -100,16 +90,6 @@ def verify_file_hash(file_path: Path, expected_sha256: str) -> bool:
         for chunk in iter(lambda: f.read(8192), b''):
             sha256.update(chunk)
     return sha256.hexdigest() == expected_sha256
-
-
-def checkout_commit(repo_path: Path, commit_hash: str):
-    """Checkout specific commit (read-only, creates detached HEAD)."""
-    subprocess.run(
-        ['git', 'checkout', commit_hash],
-        cwd=repo_path,
-        capture_output=True,
-        check=True
-    )
 
 
 def build_workspace(
@@ -266,13 +246,17 @@ def main():
     
     init_database()
     
-    result = build_workspace(
-        commit_id=args.commit_id,
-        copyright_id=args.copyright_id,
-        output_base=args.output,
-        verify_hashes=not args.no_verify,
-        verbose=args.verbose,
-    )
+    try:
+        result = build_workspace(
+            commit_id=args.commit_id,
+            copyright_id=args.copyright_id,
+            output_base=args.output,
+            verify_hashes=not args.no_verify,
+            verbose=args.verbose,
+        )
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
     
     print(f"\nWorkspace built: {result['workspace_dir']}")
     print(f"  Status: {result['status']}")

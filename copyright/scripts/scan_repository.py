@@ -52,11 +52,11 @@ DEFAULT_EXCLUDE_PATTERNS = [
 ]
 
 
-def run_git_command(cmd: list[str], cwd: Path) -> str:
+def run_git_command(cmd: list, cwd: Path) -> str:
     """Run git command and return output."""
     result = subprocess.run(
         ['git'] + cmd,
-        cwd=cwd,
+        cwd=str(cwd),
         capture_output=True,
         text=True,
         check=True
@@ -69,7 +69,7 @@ def get_current_commit(repo_path: Path) -> str:
     return run_git_command(['rev-parse', 'HEAD'], repo_path)
 
 
-def get_git_tracked_files(repo_path: Path) -> list[str]:
+def get_git_tracked_files(repo_path: Path) -> list:
     """Get all git tracked files."""
     output = run_git_command(['ls-files'], repo_path)
     return [f for f in output.split('\n') if f]
@@ -105,7 +105,7 @@ def calculate_sha256(file_path: Path) -> str:
     return sha256.hexdigest()
 
 
-def count_lines(file_path: Path) -> tuple[int, int]:
+def count_lines(file_path: Path) -> tuple:
     """Count total and effective lines."""
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -125,6 +125,16 @@ def detect_language(file_path: str) -> str:
     return LANGUAGE_MAP.get(ext, 'Unknown')
 
 
+def validate_repo_path(repo_path: Path):
+    """Validate repository path exists and is a git repo."""
+    if not repo_path.exists():
+        raise FileNotFoundError(f"Repository path does not exist: {repo_path}")
+    if not repo_path.is_dir():
+        raise NotADirectoryError(f"Path is not a directory: {repo_path}")
+    if not (repo_path / '.git').exists():
+        raise ValueError(f"Not a Git repository (no .git found): {repo_path}")
+
+
 def scan_repository(
     repo_path: Path,
     commit_hash: Optional[str] = None,
@@ -142,6 +152,9 @@ def scan_repository(
         exclude_dirs = DEFAULT_EXCLUDE_DIRS
     if exclude_patterns is None:
         exclude_patterns = DEFAULT_EXCLUDE_PATTERNS
+    
+    # 验证仓库路径
+    validate_repo_path(repo_path)
     
     # 初始化数据库
     init_database()
@@ -205,7 +218,7 @@ def scan_repository(
         # 获取文件大小
         file_size = full_path.stat().st_size
         
-        # 插入数据库
+        # 插入数据库（幂等：重复扫描会更新而非报错）
         file_id = insert_file(
             commit_id=commit_id,
             file_path=file_path,
@@ -280,12 +293,10 @@ def main():
     
     args = parser.parse_args()
     
-    if not args.repo_path.exists():
-        print(f"Error: Repository path does not exist: {args.repo_path}")
-        sys.exit(1)
-    
-    if not (args.repo_path / '.git').exists():
-        print(f"Error: Not a Git repository: {args.repo_path}")
+    try:
+        validate_repo_path(args.repo_path)
+    except (FileNotFoundError, NotADirectoryError, ValueError) as e:
+        print(f"Error: {e}")
         sys.exit(1)
     
     result = scan_repository(args.repo_path, args.commit, verbose=args.verbose)
