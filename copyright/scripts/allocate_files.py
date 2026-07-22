@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Allocate files to copyrights based on configuration."""
+"""Allocate files to copyrights based on configuration.
+
+Integrates with Feature 1 (used code markers) and Feature 2 (team ownership)
+to automatically skip files that are:
+- Already used in a previous copyright application
+- Not primarily written by team members (for open-source based projects)
+"""
 
 import argparse
 import json
@@ -13,7 +19,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from database import (
     init_database, get_connection, allocate_file,
-    check_file_allocated, get_allocation, clear_allocations
+    check_file_allocated, get_allocation, clear_allocations,
+    get_used_file_ids, get_team_eligible_file_ids
 )
 
 
@@ -109,13 +116,21 @@ def allocate_files_from_config(
     files: list,
     copyrights_config: list,
     verbose: bool = False,
-    force: bool = False
+    force: bool = False,
+    skip_used: bool = True,
+    skip_non_team: bool = True,
 ) -> dict:
     """
     Allocate files to copyrights based on configuration.
     
     Args:
-        force: If True, clear existing allocations first (re-allocation).
+        commit_id: Database commit ID
+        files: List of file dicts from scan result
+        copyrights_config: List of copyright configs from YAML
+        verbose: Print progress
+        force: If True, clear existing allocations first (re-allocation)
+        skip_used: If True, skip files marked as used in previous copyrights
+        skip_non_team: If True, skip files not primarily written by team
     
     Returns:
         dict with allocation results and conflicts
@@ -125,6 +140,8 @@ def allocate_files_from_config(
         'unallocated': [],
         'conflicts': [],
         'excluded': [],
+        'skipped_used': [],
+        'skipped_non_team': [],
         'reallocated': False,
     }
     
@@ -134,6 +151,20 @@ def allocate_files_from_config(
         results['reallocated'] = True
         if verbose:
             print("Cleared existing allocations for re-allocation")
+    
+    # 获取已使用文件集合（Feature 1）
+    used_file_ids = set()
+    if skip_used:
+        used_file_ids = get_used_file_ids(commit_id)
+        if verbose and used_file_ids:
+            print(f"Excluding {len(used_file_ids)} previously used files")
+    
+    # 获取团队合格文件集合（Feature 2）
+    team_eligible_ids = None
+    if skip_non_team:
+        team_eligible_ids = get_team_eligible_file_ids(commit_id)
+        if team_eligible_ids is not None and verbose:
+            print(f"Team eligibility active: {len(team_eligible_ids)} eligible files")
     
     # 为每个软著创建记录
     copyright_db_ids = {}
@@ -154,6 +185,28 @@ def allocate_files_from_config(
         file_path = file['path']
         file_id = file['id']
         
+        # Feature 1: 跳过已使用文件
+        if skip_used and file_id in used_file_ids:
+            results['skipped_used'].append({
+                'file': file_path,
+                'file_id': file_id,
+                'reason': 'used_in_previous_copyright',
+            })
+            if verbose:
+                print(f"  ⊘ Skipped (used): {file_path}")
+            continue
+        
+        # Feature 2: 跳过非团队文件
+        if team_eligible_ids is not None and file_id not in team_eligible_ids:
+            results['skipped_non_team'].append({
+                'file': file_path,
+                'file_id': file_id,
+                'reason': 'not_team_eligible',
+            })
+            if verbose:
+                print(f"  ⊘ Skipped (non-team): {file_path}")
+            continue
+        
         # 检查是否已分配
         if check_file_allocated(commit_id, file_id):
             existing_cr = get_allocation(commit_id, file_id)
@@ -164,7 +217,7 @@ def allocate_files_from_config(
             })
             continue
         
-        # 尝试匹配每个软著
+        # 尝试匹配到软著
         allocated = False
         for cr_config in copyrights_config:
             cr_id = cr_config['id']
@@ -172,34 +225,27 @@ def allocate_files_from_config(
             exclude_paths = cr_config.get('exclude_paths', [])
             
             if should_include_file(file_path, include_paths, exclude_paths):
-                # 尝试分配
-                success = allocate_file(commit_id, file_id, copyright_db_ids[cr_id])
-                
-                if success:
-                    results['allocations'][cr_id].append({
-                        'file_id': file_id,
-                        'path': file_path,
-                        'sha256': file['sha256'],
-                        'language': file['language'],
-                        'effective_lines': file['effective_lines'],
-                    })
+                db_id = copyright_db_ids[cr_id]
+                if allocate_file(commit_id, file_id, db_id):
+                    results['allocations'][cr_id].append(file)
                     allocated = True
                     if verbose:
-                        print(f"  {file_path} -> {cr_id}")
+                        print(f"  ✓ {file_path} -> {cr_id}")
+                    break
                 else:
                     results['conflicts'].append({
                         'file': file_path,
                         'file_id': file_id,
-                        'reason': f'allocation_failed_for_{cr_id}'
+                        'reason': f'conflict_allocating_to_{cr_id}'
                     })
-                break
+                    allocated = True  # 已处理（冲突）
+                    break
         
-        if not allocated and not any(c['file'] == file_path for c in results['conflicts']):
+        if not allocated:
             results['unallocated'].append({
+                'file': file_path,
                 'file_id': file_id,
-                'path': file_path,
-                'language': file['language'],
-                'effective_lines': file['effective_lines'],
+                'effective_lines': file.get('effective_lines', 0),
             })
     
     return results
@@ -244,6 +290,13 @@ def export_allocations(results: dict, output_dir: Path, copyrights_config: list)
         with open(conflict_path, 'w', encoding='utf-8') as f:
             json.dump(results['conflicts'], f, indent=2, ensure_ascii=False)
     
+    # 生成跳过文件报告（Feature 1 & 2）
+    skipped = results.get('skipped_used', []) + results.get('skipped_non_team', [])
+    if skipped:
+        skipped_path = output_dir / 'skipped-files.json'
+        with open(skipped_path, 'w', encoding='utf-8') as f:
+            json.dump(skipped, f, indent=2, ensure_ascii=False)
+    
     # 生成汇总报告
     summary_path = output_dir / 'allocation-summary.json'
     with open(summary_path, 'w', encoding='utf-8') as f:
@@ -252,6 +305,8 @@ def export_allocations(results: dict, output_dir: Path, copyrights_config: list)
             'total_allocated': sum(len(files) for files in results['allocations'].values()),
             'total_unallocated': len(results['unallocated']),
             'total_conflicts': len(results['conflicts']),
+            'total_skipped_used': len(results.get('skipped_used', [])),
+            'total_skipped_non_team': len(results.get('skipped_non_team', [])),
             'reallocated': results.get('reallocated', False),
             'by_copyright': {
                 cr_id: {
@@ -275,6 +330,10 @@ def main():
                        help='Output directory for allocation files')
     parser.add_argument('--force', action='store_true',
                        help='Clear existing allocations and re-allocate')
+    parser.add_argument('--no-skip-used', action='store_true',
+                       help='Do NOT skip files marked as used in previous copyrights')
+    parser.add_argument('--no-skip-non-team', action='store_true',
+                       help='Do NOT skip files not written by team members')
     parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     
     args = parser.parse_args()
@@ -304,7 +363,15 @@ def main():
     
     # 执行分配
     copyrights_config = config['copyrights']
-    results = allocate_files_from_config(commit_id, files, copyrights_config, args.verbose, args.force)
+    results = allocate_files_from_config(
+        commit_id=commit_id,
+        files=files,
+        copyrights_config=copyrights_config,
+        verbose=args.verbose,
+        force=args.force,
+        skip_used=not args.no_skip_used,
+        skip_non_team=not args.no_skip_non_team,
+    )
     
     # 导出结果
     export_allocations(results, args.output, copyrights_config)
@@ -315,6 +382,12 @@ def main():
         cr_name = next(c['name'] for c in copyrights_config if c['id'] == cr_id)
         total_lines = sum(f['effective_lines'] for f in files)
         print(f"  {cr_id} ({cr_name}): {len(files)} files, {total_lines} lines")
+    
+    if results.get('skipped_used'):
+        print(f"\n  Skipped (used): {len(results['skipped_used'])} files")
+    
+    if results.get('skipped_non_team'):
+        print(f"\n  Skipped (non-team): {len(results['skipped_non_team'])} files")
     
     if results['unallocated']:
         print(f"\n  Unallocated: {len(results['unallocated'])} files")

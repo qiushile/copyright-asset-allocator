@@ -1,8 +1,8 @@
-# 软著配置文件 - 测试用
-# 使用 hermes-agent 仓库模拟两个软著
+# 软著配置文件
+# 定义要申请的软著及其代码范围
 
 snapshot:
-  repository: hermes-agent
+  repository: my-project
   created_at: "2026-07-22"
 
 policies:
@@ -14,34 +14,47 @@ policies:
   generated_code_policy: excluded
   third_party_code_policy: excluded
 
-copyrights:
-  - id: core-agent
-    name: 智能代理核心系统
-    version: V1.0
-    description: AI代理核心调度、工具执行和会话管理系统
-    include_paths:
-      - agent/**
-      - core/**
-    exclude_paths:
-      - plugins/**
-      - tests/**
-      - docs/**
-      - scripts/**
-      - vendor/**
-      - node_modules/**
+# 团队成员（用于 Feature 2: 代码归属分析）
+# 基于 git blame 邮箱地址判别，只有团队成员新增/修改的代码才纳入软著申请
+# 如果项目基于开源项目开发，此配置确保只对团队原创代码申请软著
+team:
+  - name: 张三
+    email: zhangsan@company.com
+    role: lead
+  - name: 李四
+    email: lisi@company.com
+    role: developer
+  - name: 王五
+    email: wangwu@company.com
+    role: developer
 
-  - id: plugin-system
-    name: 插件扩展管理系统
+copyrights:
+  - id: service-a
+    name: XX服务系统
     version: V1.0
-    description: 插件加载、注册、生命周期管理和扩展接口系统
+    description: 提供XX功能的软件系统
     include_paths:
-      - plugins/**
-      - extensions/**
+      - services/a/**
+      - libs/a-core/**
     exclude_paths:
-      - agent/**
-      - core/**
-      - tests/**
-      - docs/**
-      - scripts/**
+      - services/b/**
+      - services/c/**
+      - shared/**
       - vendor/**
-      - node_modules/**
+      - generated/**
+      - tests/**
+
+  - id: service-b
+    name: YY处理系统
+    version: V1.0
+    description: 处理YY数据的软件系统
+    include_paths:
+      - services/b/**
+      - libs/b-core/**
+    exclude_paths:
+      - services/a/**
+      - services/c/**
+      - shared/**
+      - vendor/**
+      - generated/**
+      - tests/**

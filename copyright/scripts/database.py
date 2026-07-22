@@ -142,12 +142,97 @@ def init_database():
             )
         """)
         
+        # ========== 新增表 ==========
+        
+        # 已申请软著代码标记表（功能1）
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS used_code_markers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                commit_id INTEGER NOT NULL,
+                file_id INTEGER NOT NULL,
+                copyright_name TEXT NOT NULL,
+                source_document TEXT,
+                line_start INTEGER,
+                line_end INTEGER,
+                code_hash TEXT,
+                marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (commit_id) REFERENCES commits(id),
+                FOREIGN KEY (file_id) REFERENCES files(id)
+            )
+        """)
+        
+        # 已使用文件表（文件级别标记）
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS used_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                commit_id INTEGER NOT NULL,
+                file_id INTEGER NOT NULL,
+                copyright_name TEXT NOT NULL,
+                source_document TEXT,
+                match_type TEXT DEFAULT 'exact',
+                marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (commit_id) REFERENCES commits(id),
+                FOREIGN KEY (file_id) REFERENCES files(id),
+                UNIQUE(commit_id, file_id, copyright_name)
+            )
+        """)
+        
+        # 团队人员表（功能2）
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS team_members (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                role TEXT DEFAULT 'developer',
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # 代码归属表（功能2：基于 git blame 的行级归属）
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS code_ownership (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                commit_id INTEGER NOT NULL,
+                file_id INTEGER NOT NULL,
+                line_start INTEGER NOT NULL,
+                line_end INTEGER NOT NULL,
+                author_email TEXT NOT NULL,
+                author_name TEXT,
+                is_team_member INTEGER DEFAULT 0,
+                commit_hash TEXT,
+                FOREIGN KEY (commit_id) REFERENCES commits(id),
+                FOREIGN KEY (file_id) REFERENCES files(id)
+            )
+        """)
+        
+        # 文件团队代码统计表
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS file_team_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                commit_id INTEGER NOT NULL,
+                file_id INTEGER NOT NULL,
+                total_lines INTEGER DEFAULT 0,
+                team_lines INTEGER DEFAULT 0,
+                team_ratio REAL DEFAULT 0.0,
+                is_eligible INTEGER DEFAULT 0,
+                FOREIGN KEY (commit_id) REFERENCES commits(id),
+                FOREIGN KEY (file_id) REFERENCES files(id),
+                UNIQUE(commit_id, file_id)
+            )
+        """)
+        
         # 索引
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_files_commit ON files(commit_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_files_path ON files(file_path)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_allocations_commit ON allocations(commit_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_allocations_file ON allocations(file_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_allocations_copyright ON allocations(copyright_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_used_files_commit ON used_files(commit_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_used_files_file ON used_files(file_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_code_ownership_commit ON code_ownership(commit_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_code_ownership_file ON code_ownership(file_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_code_ownership_email ON code_ownership(author_email)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_team_stats_commit ON file_team_stats(commit_id)")
 
 
 def get_or_create_repository(name: str, path: str) -> int:
@@ -188,7 +273,6 @@ def insert_file(commit_id: int, file_path: str, sha256: str, language: str,
     """Insert or update file record (idempotent for re-scans)."""
     with get_connection() as conn:
         cursor = conn.cursor()
-        # 使用 INSERT OR REPLACE 支持重复扫描
         cursor.execute("""
             INSERT INTO files (commit_id, file_path, sha256, language, total_lines, effective_lines, file_size)
             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -200,7 +284,6 @@ def insert_file(commit_id: int, file_path: str, sha256: str, language: str,
                 file_size = excluded.file_size
         """, (commit_id, file_path, sha256, language, total_lines, effective_lines, file_size))
         
-        # 获取 file_id（可能是已有的或新插入的）
         cursor.execute(
             "SELECT id FROM files WHERE commit_id = ? AND file_path = ?",
             (commit_id, file_path)
@@ -215,8 +298,6 @@ def allocate_file(commit_id: int, file_id: int, copyright_id: int) -> bool:
     """
     with get_connection() as conn:
         cursor = conn.cursor()
-        
-        # 检查是否已分配
         cursor.execute("""
             SELECT copyright_id FROM allocations
             WHERE commit_id = ? AND file_id = ?
@@ -226,7 +307,6 @@ def allocate_file(commit_id: int, file_id: int, copyright_id: int) -> bool:
         if existing:
             return False
         
-        # 插入分配记录
         cursor.execute("""
             INSERT INTO allocations (commit_id, file_id, copyright_id)
             VALUES (?, ?, ?)
@@ -277,6 +357,55 @@ def clear_allocations(commit_id: int):
         cursor = conn.cursor()
         cursor.execute("DELETE FROM allocations WHERE commit_id = ?", (commit_id,))
         cursor.execute("DELETE FROM copyrights WHERE commit_id = ?", (commit_id,))
+
+
+def is_file_used(commit_id: int, file_id: int) -> bool:
+    """Check if file has been marked as used in a previous copyright."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT COUNT(*) FROM used_files
+            WHERE commit_id = ? AND file_id = ?
+        """, (commit_id, file_id))
+        return cursor.fetchone()[0] > 0
+
+
+def get_used_file_ids(commit_id: int) -> set:
+    """Get all file IDs marked as used."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT file_id FROM used_files WHERE commit_id = ?
+        """, (commit_id,))
+        return set(row[0] for row in cursor.fetchall())
+
+
+def is_file_team_eligible(commit_id: int, file_id: int) -> bool:
+    """Check if file is eligible (majority team-written)."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT is_eligible FROM file_team_stats
+            WHERE commit_id = ? AND file_id = ?
+        """, (commit_id, file_id))
+        row = cursor.fetchone()
+        return bool(row[0]) if row else True  # 默认合格（未分析时）
+
+
+def get_team_eligible_file_ids(commit_id: int) -> Optional[set]:
+    """Get all team-eligible file IDs. Returns None if analysis not done."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT COUNT(*) FROM file_team_stats WHERE commit_id = ?
+        """, (commit_id,))
+        if cursor.fetchone()[0] == 0:
+            return None  # 未执行分析
+        cursor.execute("""
+            SELECT file_id FROM file_team_stats
+            WHERE commit_id = ? AND is_eligible = 1
+        """, (commit_id,))
+        return set(row[0] for row in cursor.fetchall())
 
 
 if __name__ == "__main__":

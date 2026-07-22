@@ -1,0 +1,43 @@
+snapshot:
+  repository: my-project
+  created_at: '2026-07-22'
+  auto_generated: true
+policies:
+  path_overlap: forbidden
+  exact_content_overlap: forbidden
+  copied_code_detection: enabled
+  unallocated_file_access: forbidden
+  shared_file_policy: excluded
+  generated_code_policy: excluded
+  third_party_code_policy: excluded
+copyrights:
+- id: auto-01
+  name: 模块1系统
+  version: V1.0
+  description: 自动拆分生成 - 包含 11 个文件, 774 有效代码行
+  include_paths:
+  - libs/protocol-common/**
+  - services/collector/**
+  - services/collector/models/**
+  - services/parser/models/**
+  exclude_paths: []
+- id: auto-02
+  name: 模块2系统
+  version: V1.0
+  description: 自动拆分生成 - 包含 11 个文件, 776 有效代码行
+  include_paths:
+  - services/parser/engine/**
+  - services/parser/transforms/**
+  - shared/utils/**
+  - tests/**
+  exclude_paths: []
+- id: auto-03
+  name: 模块3系统
+  version: V1.0
+  description: 自动拆分生成 - 包含 9 个文件, 772 有效代码行
+  include_paths:
+  - ./**
+  - services/collector/handlers/**
+  - services/collector/transport/**
+  - services/parser/**
+  exclude_paths: []

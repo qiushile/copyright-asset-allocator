@@ -14,6 +14,16 @@ policies:
   generated_code_policy: excluded
   third_party_code_policy: excluded
 
+# 团队成员（用于代码归属分析）
+# 基于 git blame 邮箱地址判别
+team:
+  - name: 邱世乐
+    email: qiushile@example.com
+    role: lead
+  - name: 开发者A
+    email: dev-a@example.com
+    role: developer
+
 copyrights:
   - id: collector
     name: 实时数据采集与传输系统
