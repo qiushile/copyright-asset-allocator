@@ -218,8 +218,8 @@ def cmd_detect(args):
 
 
 def cmd_generate(args):
-    """Generate DOCX materials."""
-    from generate_docx import generate_code_material
+    """Generate DOCX materials (程序鉴别材料 + 文档鉴别材料)."""
+    from generate_docx import generate_code_material, generate_doc_material
     import json
     
     workspace_dir = Path('copyright/workspaces') / args.copyright_id
@@ -238,11 +238,23 @@ def cmd_generate(args):
     
     software_name = manifest['softwareName']
     version = manifest['version']
+    description = manifest.get('description', '')
     output_dir = Path('copyright/outputs') / args.copyright_id
     
-    print(f"Generating code materials for: {software_name} {version}")
+    print(f"Generating materials for: {software_name} {version}")
+    print()
+    
+    # 程序鉴别材料（纯代码，60页标准）
+    print("=== 程序鉴别材料 ===")
     generate_code_material(workspace_dir, output_dir, software_name, version)
-    print(f"\nDOCX generated in: {output_dir}")
+    print()
+    
+    # 文档鉴别材料（设计文档，60页标准）
+    if not getattr(args, 'code_only', False):
+        print("=== 文档鉴别材料 ===")
+        generate_doc_material(workspace_dir, output_dir, software_name, version, description)
+    
+    print(f"\nAll materials generated in: {output_dir}")
 
 
 def cmd_audit(args):
@@ -625,6 +637,8 @@ Example workflow:
     # generate
     generate_parser = subparsers.add_parser('generate', help='Generate DOCX materials')
     generate_parser.add_argument('copyright_id', help='Copyright ID')
+    generate_parser.add_argument('--code-only', action='store_true',
+                                help='Only generate code material (skip document material)')
     generate_parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     
     # audit
