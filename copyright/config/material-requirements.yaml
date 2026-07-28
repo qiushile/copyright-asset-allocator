@@ -1,0 +1,73 @@
+schema_version: 1
+name: 软件著作权鉴别材料严格规则
+
+page_selection:
+  page_size: A4
+  total_pages: 60
+  front_pages: 30
+  back_pages: 30
+  mode: first_30_and_last_30_consecutive_pages
+  exact_output_pages: true
+  cover_and_toc_inside_identification_pages: false
+
+program_material:
+  lines_per_page: 50
+  effective_lines_only: true
+  blank_lines_count: false
+  line_numbers: forbidden
+  pure_repository_source_only: true
+  explanatory_filler: forbidden
+  max_print_columns: 100
+  font:
+    strategy: maximize_without_increasing_page_count
+    readable: required
+    generation_point_size: 8.15
+    minimum_rendered_point_size: 8.0
+
+document_material:
+  lines_per_page: 30
+  effective_lines_only: true
+  blank_lines_count: false
+  line_numbers: forbidden
+  page_footer_numbers: allowed
+  user_friendly_layout:
+    paragraphs: required
+    section_numbering: required
+    consistent_hierarchy: required
+  supplemental_operation_tips:
+    heading: 补充操作提示
+    formatted_sections: required
+    repeated_substantive_content: forbidden
+    looping_template_filler: forbidden
+  content_quality:
+    system_specific: required
+    logically_related: required
+    technically_reviewable: required
+    placeholders: forbidden
+    unsupported_claims: forbidden
+  main_function_section:
+    heading: 软件的主要功能
+    minimum_characters: 500
+    maximum_characters: 1300
+  max_print_columns: 76
+  font:
+    strategy: maximize_without_increasing_page_count
+    readable: required
+    generation_point_size: 10.15
+    minimum_rendered_point_size: 10.0
+
+generation:
+  insufficient_material: fail_instead_of_blank_or_repeated_padding
+  preserve_source_order: true
+  output_formats:
+    - markdown
+    - pdf
+  forbidden_placeholder_markers:
+    - TODO
+    - FIXME
+    - 待补充
+    - 占位内容
+    - Lorem ipsum
+    - 通用填充
+
+protected_assets: []

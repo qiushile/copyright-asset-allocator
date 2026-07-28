@@ -39,6 +39,9 @@ copyright/outputs/*.txt
 # Keep config
 !copyright/config/copyrights.yaml.example
 
+# Machine-local submitted-material freeze registry
+copyright/config/material-protected-assets.local.yaml
+
 # IDE
 .idea/
 .vscode/

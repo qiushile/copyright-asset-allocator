@@ -1,0 +1,9 @@
+protected_assets:
+  - copyright_id: "example-01"
+    software_name: 示例系统
+    status: submitted
+    immutable: true
+    path: /absolute/path/to/submitted-materials/example-01
+    digest_algorithm: openssl-directory-v1
+    expected_digest: replace-with-computed-directory-digest
+    policy: 已提交材料只允许只读审计，禁止重新生成或覆盖
