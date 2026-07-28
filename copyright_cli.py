@@ -218,8 +218,11 @@ def cmd_detect(args):
 
 
 def cmd_generate(args):
-    """Generate DOCX materials (程序鉴别材料 + 文档鉴别材料)."""
-    from generate_docx import generate_code_material, generate_doc_material
+    """Generate materials through Markdown -> PDF -> final PDF audit."""
+    from generate_markdown_pdf import (
+        generate_document_markdown_pdf,
+        generate_program_markdown_pdf,
+    )
     import json
     
     workspace_dir = Path('copyright/workspaces') / args.copyright_id
@@ -240,19 +243,45 @@ def cmd_generate(args):
     version = manifest['version']
     description = manifest.get('description', '')
     output_dir = Path('copyright/outputs') / args.copyright_id
+
+    from material_requirements import (
+        FrozenAssetError,
+        assert_generation_allowed,
+        load_material_requirements,
+    )
+    requirements = load_material_requirements(getattr(args, 'requirements', None))
+    try:
+        assert_generation_allowed(args.copyright_id, software_name, requirements)
+    except FrozenAssetError as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
     
     print(f"Generating materials for: {software_name} {version}")
     print()
     
-    # 程序鉴别材料（纯代码，60页标准）
+    # 程序鉴别材料：真实代码 Markdown -> PDF -> 复核。
     print("=== 程序鉴别材料 ===")
-    generate_code_material(workspace_dir, output_dir, software_name, version)
+    generate_program_markdown_pdf(
+        workspace_dir,
+        output_dir,
+        software_name,
+        version,
+        requirements,
+    )
     print()
     
-    # 文档鉴别材料（设计文档，60页标准）
+    # 文档鉴别材料：系统专用 Markdown -> PDF -> 复核。
     if not getattr(args, 'code_only', False):
         print("=== 文档鉴别材料 ===")
-        generate_doc_material(workspace_dir, output_dir, software_name, version, description)
+        generate_document_markdown_pdf(
+            workspace_dir,
+            output_dir,
+            software_name,
+            version,
+            description,
+            Path(args.manual) if args.manual else None,
+            requirements,
+        )
     
     print(f"\nAll materials generated in: {output_dir}")
 
@@ -270,7 +299,12 @@ def cmd_audit(args):
     with open(scan_result_path, 'r', encoding='utf-8') as f:
         scan_result = json.load(f)
     
-    results = audit_commit(scan_result['commit_id'], Path('copyright/workspaces'))
+    results = audit_commit(
+        scan_result['commit_id'],
+        Path('copyright/workspaces'),
+        Path('copyright/outputs'),
+        getattr(args, 'requirements', None),
+    )
     generate_audit_report(results, Path('copyright/outputs/final-audit.json'))
     
     print(f"\nFinal Audit: {'PASSED' if results['passed'] else 'FAILED'}")
@@ -280,6 +314,45 @@ def cmd_audit(args):
     if not results['passed']:
         for err in results['errors']:
             print(f"  X {err}")
+
+
+def cmd_requirements(args):
+    """Validate the material rule source and frozen submitted assets."""
+    from material_requirements import (
+        audit_protected_assets,
+        load_material_requirements,
+        requirement_summary,
+    )
+    import json
+
+    requirements = load_material_requirements(args.config)
+    protected = audit_protected_assets(requirements)
+    report = {
+        'passed': protected['passed'],
+        'config': requirements['_config_path'],
+        'summary': requirement_summary(requirements),
+        'protected_assets': protected,
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if not report['passed']:
+        sys.exit(1)
+
+
+def cmd_material_audit(args):
+    """Audit one copyright material directory against the strict rules."""
+    from material_requirements import load_material_requirements
+    from validate_materials import audit_material_directory
+    import json
+
+    requirements = load_material_requirements(args.requirements)
+    report = audit_material_directory(Path(args.directory), requirements)
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if not report['passed']:
+        sys.exit(1)
 
 
 # ============================================================
@@ -557,7 +630,7 @@ Commands:
   validate    Validate allocations (completeness, conflicts)
   workspace   Build isolated workspace for a copyright
   detect      Detect code duplication between copyrights
-  generate    Generate DOCX code materials
+  generate    Generate Markdown, render PDF, then audit final PDF
   audit       Final audit before submission
   mark-used   [Feature 1] Mark code used in previous copyrights
   ownership   [Feature 2] Analyze code ownership (git blame)
@@ -635,15 +708,36 @@ Example workflow:
     detect_parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     
     # generate
-    generate_parser = subparsers.add_parser('generate', help='Generate DOCX materials')
+    generate_parser = subparsers.add_parser(
+        'generate', help='Generate Markdown and audited PDF materials')
     generate_parser.add_argument('copyright_id', help='Copyright ID')
     generate_parser.add_argument('--code-only', action='store_true',
                                 help='Only generate code material (skip document material)')
+    generate_parser.add_argument('--requirements',
+                                help='Material requirements YAML')
+    generate_parser.add_argument('--manual',
+                                help='System-specific Markdown manual for document material')
     generate_parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     
     # audit
     audit_parser = subparsers.add_parser('audit', help='Final audit')
+    audit_parser.add_argument('--requirements', type=Path,
+                              help='Material requirements YAML')
     audit_parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
+
+    # requirement source and submitted-material freeze
+    requirements_parser = subparsers.add_parser(
+        'requirements', help='Validate strict material rules and frozen assets')
+    requirements_parser.add_argument('--config', type=Path,
+                                     help='Material requirements YAML')
+
+    # standalone material audit
+    material_audit_parser = subparsers.add_parser(
+        'material-audit', help='Audit one material directory')
+    material_audit_parser.add_argument('directory', help='Material directory')
+    material_audit_parser.add_argument('--requirements', type=Path,
+                                       help='Material requirements YAML')
+    material_audit_parser.add_argument('--output', help='Optional JSON report path')
     
     # mark-used (Feature 1)
     mark_used_parser = subparsers.add_parser('mark-used',
@@ -747,6 +841,8 @@ Example workflow:
         'detect': cmd_detect,
         'generate': cmd_generate,
         'audit': cmd_audit,
+        'requirements': cmd_requirements,
+        'material-audit': cmd_material_audit,
         'mark-used': cmd_mark_used,
         'ownership': cmd_ownership,
         'set-since': cmd_set_since,
