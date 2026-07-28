@@ -25,10 +25,13 @@ team:
     role: developer
 
 copyrights:
+  # description 会直接作为《软件的主要功能》，去除空白后必须为500至1300字。
+  # 必须按真实系统填写；不能使用通用模板、重复段落或占位内容凑字数。
   - id: collector
     name: 实时数据采集与传输系统
     version: V1.0
-    description: 接收TCP数据、完成报文解密并发送至Kafka
+    description: ""
+    description_status: required_manual_input_500_to_1300_characters
     include_paths:
       - services/collector/**
       - libs/protocol-common/**
@@ -40,7 +43,8 @@ copyrights:
   - id: parser
     name: 数据解析与标准化处理系统
     version: V1.0
-    description: 消费原始Kafka消息并完成协议解析和字段标准化
+    description: ""
+    description_status: required_manual_input_500_to_1300_characters
     include_paths:
       - services/parser/**
     exclude_paths:

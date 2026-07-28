@@ -14,7 +14,8 @@ copyrights:
 - id: auto-01
   name: 模块1系统
   version: V1.0
-  description: 自动拆分生成 - 包含 11 个文件, 774 有效代码行
+  description: ''
+  description_status: required_manual_input_500_to_1300_characters
   include_paths:
   - libs/protocol-common/**
   - services/collector/**
@@ -24,7 +25,8 @@ copyrights:
 - id: auto-02
   name: 模块2系统
   version: V1.0
-  description: 自动拆分生成 - 包含 11 个文件, 776 有效代码行
+  description: ''
+  description_status: required_manual_input_500_to_1300_characters
   include_paths:
   - services/parser/engine/**
   - services/parser/transforms/**
@@ -34,7 +36,8 @@ copyrights:
 - id: auto-03
   name: 模块3系统
   version: V1.0
-  description: 自动拆分生成 - 包含 9 个文件, 772 有效代码行
+  description: ''
+  description_status: required_manual_input_500_to_1300_characters
   include_paths:
   - ./**
   - services/collector/handlers/**

@@ -610,7 +610,8 @@ def cmd_auto_split(args):
     
     print(f"\n  Config: {output_config}")
     print(f"  Report: {output_report}")
-    print(f"\n  Next: python copyright_cli.py allocate --config {output_config} --force")
+    print("\n  Required: first write a truthful 500-1300 character description for each copyright")
+    print(f"  Next: python copyright_cli.py allocate --config {output_config} --force")
 
 
 # ============================================================
@@ -891,10 +892,13 @@ team:
     role: developer
 
 copyrights:
+  # description 会直接作为《软件的主要功能》，去除空白后必须为500至1300字。
+  # 必须按真实系统填写；不能使用通用模板、重复段落或占位内容凑字数。
   - id: service-a
     name: XX服务系统
     version: V1.0
-    description: 提供XX功能的软件系统
+    description: ""
+    description_status: required_manual_input_500_to_1300_characters
     include_paths:
       - services/a/**
       - libs/a-core/**
@@ -909,7 +913,8 @@ copyrights:
   - id: service-b
     name: YY处理系统
     version: V1.0
-    description: 处理YY数据的软件系统
+    description: ""
+    description_status: required_manual_input_500_to_1300_characters
     include_paths:
       - services/b/**
       - libs/b-core/**

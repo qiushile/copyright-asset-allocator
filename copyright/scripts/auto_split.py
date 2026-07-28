@@ -418,7 +418,9 @@ def auto_split(
             'id': cr_id,
             'name': cr_name,
             'version': 'V1.0',
-            'description': f'自动拆分生成 - 包含 {len(cr_files)} 个文件, {cr_total_lines} 有效代码行',
+            # 自动拆分只能确定代码范围，不能代替申请人编写真实的主要功能说明。
+            'description': '',
+            'description_status': 'required_manual_input_500_to_1300_characters',
             'include_paths': sorted(include_paths),
             'exclude_paths': [],
             'files': cr_files,
@@ -474,6 +476,7 @@ def generate_config_yaml(
             'name': cr['name'],
             'version': cr['version'],
             'description': cr['description'],
+            'description_status': cr['description_status'],
             'include_paths': cr['include_paths'],
             'exclude_paths': cr['exclude_paths'],
         })
