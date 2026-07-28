@@ -1,17 +1,31 @@
 #!/usr/bin/env python3
 """Final audit: cross-check all copyrights before submission."""
 
+from __future__ import annotations
+
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from database import init_database, get_connection
+from material_requirements import (
+    audit_protected_assets,
+    load_material_requirements,
+    requirement_summary,
+)
+from validate_materials import audit_material_directory
 
 
-def audit_commit(commit_id: int, workspaces_dir: Path) -> dict:
+def audit_commit(
+    commit_id: int,
+    workspaces_dir: Path,
+    outputs_dir: Path = Path('copyright/outputs'),
+    requirements_path: Path | None = None,
+) -> dict:
     """
     Final audit before submission.
     
@@ -29,13 +43,31 @@ def audit_commit(commit_id: int, workspaces_dir: Path) -> dict:
         'warnings': [],
         'copyrights': [],
     }
+
+    requirements = load_material_requirements(requirements_path)
+    results['material_requirements'] = requirement_summary(requirements)
+    protected_assets = audit_protected_assets(requirements)
+    results['protected_assets'] = protected_assets
+    if not protected_assets['passed']:
+        results['passed'] = False
+        for asset in protected_assets['assets']:
+            if not asset['passed']:
+                results['errors'].append({
+                    'type': 'protected_asset_changed',
+                    'copyright_id': asset['copyright_id'],
+                    'message': (
+                        f"冻结材料{asset['copyright_id']}校验失败："
+                        f"expected={asset['expected_digest']}, actual={asset.get('actual_digest')}"
+                    ),
+                    'details': asset,
+                })
     
     with get_connection() as conn:
         cursor = conn.cursor()
         
         # 获取所有软著
         cursor.execute("""
-            SELECT id, copyright_id, name, version, status
+            SELECT id, copyright_id, name, version, status, description
             FROM copyrights
             WHERE commit_id = ?
         """, (commit_id,))
@@ -46,7 +78,10 @@ def audit_commit(commit_id: int, workspaces_dir: Path) -> dict:
         all_paths = {}  # path -> copyright_id
         all_hashes = {}  # sha256 -> [(copyright_id, path)]
         
-        for cr_db_id, cr_id, cr_name, cr_version, cr_status in copyrights:
+        for cr_db_id, cr_id, cr_name, cr_version, cr_status, cr_description in copyrights:
+            description = (cr_description or '').strip()
+            main_function_rule = requirements['document_material']['main_function_section']
+            main_function_characters = len(re.sub(r'\s+', '', description))
             cr_result = {
                 'copyright_id': cr_id,
                 'name': cr_name,
@@ -56,7 +91,24 @@ def audit_commit(commit_id: int, workspaces_dir: Path) -> dict:
                 'total_lines': 0,
                 'workspace_exists': False,
                 'manifest_valid': False,
+                'main_function_characters': main_function_characters,
             }
+            if not (
+                int(main_function_rule['minimum_characters'])
+                <= main_function_characters
+                <= int(main_function_rule['maximum_characters'])
+            ):
+                results['passed'] = False
+                results['errors'].append({
+                    'type': 'main_function_characters',
+                    'copyright_id': cr_id,
+                    'message': (
+                        f'{cr_id}: 《软件的主要功能》必须为'
+                        f"{main_function_rule['minimum_characters']}至"
+                        f"{main_function_rule['maximum_characters']}字，"
+                        f'实际{main_function_characters}字'
+                    ),
+                })
             
             # 获取分配的文件
             cursor.execute("""
@@ -159,6 +211,39 @@ def audit_commit(commit_id: int, workspaces_dir: Path) -> dict:
                     'copyright_id': cr_id,
                     'message': f'{cr_id}: workspace not built'
                 })
+
+            material_dir = outputs_dir / cr_id
+            if material_dir.exists():
+                material_audit = audit_material_directory(
+                    material_dir,
+                    requirements,
+                    require_rendered_pair=True,
+                )
+                cr_result['material_audit'] = material_audit
+                if not material_audit['passed']:
+                    results['passed'] = False
+                    for issue in material_audit['errors']:
+                        results['errors'].append({
+                            'type': f"material_{issue['code']}",
+                            'copyright_id': cr_id,
+                            'message': f"{cr_id}: {issue['message']}",
+                            'details': issue,
+                        })
+                for issue in material_audit['warnings']:
+                    results['warnings'].append({
+                        'type': f"material_{issue['code']}",
+                        'copyright_id': cr_id,
+                        'message': f"{cr_id}: {issue['message']}",
+                        'details': issue,
+                    })
+            else:
+                cr_result['material_audit'] = None
+                results['passed'] = False
+                results['errors'].append({
+                    'type': 'missing_material_output',
+                    'copyright_id': cr_id,
+                    'message': f'{cr_id}: 缺少鉴别材料输出目录，不能通过提交前审计',
+                })
             
             results['copyrights'].append(cr_result)
     
@@ -231,6 +316,10 @@ def main():
     parser.add_argument('--commit-id', type=int, required=True, help='Commit ID to audit')
     parser.add_argument('--workspaces', type=Path, default=Path('copyright/workspaces'),
                        help='Workspaces directory')
+    parser.add_argument('--outputs', type=Path, default=Path('copyright/outputs'),
+                       help='Generated material outputs directory')
+    parser.add_argument('--requirements', type=Path,
+                       help='Material requirements YAML')
     parser.add_argument('--output', type=Path, default=Path('copyright/outputs/final-audit.json'),
                        help='Output path for audit report')
     
@@ -238,7 +327,7 @@ def main():
     
     init_database()
     
-    results = audit_commit(args.commit_id, args.workspaces)
+    results = audit_commit(args.commit_id, args.workspaces, args.outputs, args.requirements)
     generate_audit_report(results, args.output)
     
     print(f"\nFinal Audit: {'PASSED ✓' if results['passed'] else 'FAILED ✗'}")
