@@ -1,0 +1,173 @@
+{
+  "generated_at": "2026-08-11T21:25:37.906893+08:00",
+  "project_root": "/Users/qiushile/WorkStation/hexin/rental-platform",
+  "cutoff": "2025-08-02T00:00:00+08:00",
+  "first_filing_completed": "2025-10-24",
+  "similarity_threshold": 0.8,
+  "method": {
+    "working_tree_policy": "committed Git objects only; dirty paths excluded",
+    "date_policy": "every current nonblank line must have author-time on or after cutoff",
+    "overlap_policy": "exclude exact hashes and same-path normalized similarity at threshold",
+    "third_party_policy": "exclude node_modules, uni_modules, dist, build, target, vendor"
+  },
+  "repository_state": {
+    "rental-platform-backend": {
+      "commit": "153e2974f860913103eb76fb5e4ae37408976526",
+      "author_time": "2026-04-19T21:38:32+08:00",
+      "subject": "fix(config): 更新生产环境配置中的月结卡号",
+      "dirty_paths": [
+        " M .github/workflows/ci_java_build.yml",
+        " M pom.xml",
+        " M ruoyi-common/ruoyi-common-bom/pom.xml"
+      ]
+    },
+    "rental-platform-admin": {
+      "commit": "56b09faf4357bfcc066f6cce0f1374b6a7e910fd",
+      "author_time": "2026-05-29T21:06:24+08:00",
+      "subject": "feat(order): - 订单列表添加下单时间查询字段",
+      "dirty_paths": [
+        "?? devbox.json"
+      ]
+    },
+    "rental-platform-app": {
+      "commit": "1a5644ff17024e24519d7eb07f7ccec728701058",
+      "author_time": "2026-03-05T12:36:28+08:00",
+      "subject": "feat: - 修改订单详情剩余还款期数 - 修改缴纳租金弹窗内容",
+      "dirty_paths": [
+        "?? api/modules/contract-limit.js",
+        "?? api/modules/wechat-deduct.js",
+        "?? docs/REFACTOR_SUMMARY.md",
+        "?? scripts/"
+      ]
+    },
+    "rental-platform-merchant-app": {
+      "commit": "f82530dd58ce4ca1e38cf36ba7f25d17fefea45a",
+      "author_time": "2026-01-06T19:21:30+08:00",
+      "subject": "feat(system): - 添加系统版本号提示",
+      "dirty_paths": []
+    },
+    "rental-platform-app-admin": {
+      "commit": "4726604e9d15bb6d7a5ce24589b90f6bf70dc4c7",
+      "author_time": "2025-12-12T00:32:59+08:00",
+      "subject": "feat(order): - 修改订单列表，添加渠道来源、发货人等字段",
+      "dirty_paths": []
+    },
+    "rental-platform-promotion-app": {
+      "commit": "528495dcdba1b7fb522c9494d4731e6d4da81e7c",
+      "author_time": "2025-11-29T20:52:03+08:00",
+      "subject": "feat: 接口添加权限校验",
+      "dirty_paths": [
+        " M yarn.lock"
+      ]
+    },
+    "rental-platform-h5-page": {
+      "commit": "fc2b9e984a0a450942fbf2c0cf1cd254e3e351c4",
+      "author_time": "2025-12-23T11:12:23+08:00",
+      "subject": "docs(legal): 更新隐私政策和服务协议中的公司名称",
+      "dirty_paths": [
+        "?? package-lock.json",
+        "?? scripts/template/index2.html",
+        "?? src/api/wechat-deduct-h5.js"
+      ]
+    }
+  },
+  "first_filing": {
+    "anchors": {
+      "rental-platform-backend": {
+        "commit": "08872b39581132daaee64d5985007d5a700b400c",
+        "author_time": "2025-10-24T20:41:29+08:00",
+        "subject": "feat(client): 设置默认货物描述为手机",
+        "source_file_count": 1260,
+        "effective_lines": 108989
+      },
+      "rental-platform-admin": {
+        "commit": "c96eba5891eb5aae013b29c51f2c2e438c47b765",
+        "author_time": "2025-10-24T13:11:30+08:00",
+        "subject": "feat: - 修改商户添加逻辑、优化商户列表显示 - 重构登录页面",
+        "source_file_count": 440,
+        "effective_lines": 69196
+      },
+      "rental-platform-app": {
+        "commit": "3fe9a11e182c7bed79485b8f300d71cae0614ab0",
+        "author_time": "2025-10-22T06:46:50+08:00",
+        "subject": "feat: - 添加银行卡管理功能 - 开发租金缴纳功能",
+        "source_file_count": 117,
+        "effective_lines": 22250
+      }
+    },
+    "declared_scope_repositories": [
+      "rental-platform-backend",
+      "rental-platform-admin",
+      "rental-platform-app"
+    ],
+    "snapshot_source_files": 1817,
+    "snapshot_effective_lines": 200435,
+    "shown_source_files": 22,
+    "shown_pages": 60,
+    "shown_complete_snapshot": {
+      "commit": "24d7bc83117e22817352bb1deb5cea8d0d5cf64a",
+      "author_time": "2025-08-21T22:30:48+08:00",
+      "subject": "refactor(rental): 重构 App 登录相关功能，调整app登录类型为app_user，调整获取用户信息方法：LoginHelper"
+    },
+    "shown_present_at_anchor": 20,
+    "shown_absent_or_deleted_at_anchor": 2,
+    "source_documents": [
+      {
+        "path": "/Users/qiushile/WorkStation/hexin/rental-platform/rental-platform-doc/08-行政合规与软著/软著申请/源代码/程序鉴别材料-源程序前30页.md",
+        "sha256": "2b2598b84c22ae046a4739c0a5584a92e87b65eed4120411cb1ef4ca1167b6c9"
+      },
+      {
+        "path": "/Users/qiushile/WorkStation/hexin/rental-platform/rental-platform-doc/08-行政合规与软著/软著申请/源代码/程序鉴别材料-源程序后30页.md",
+        "sha256": "9dae16d4f19bfef1d10d91fe1fa2ad791cb7050e006612d2dfbf40bbe7849dbb"
+      }
+    ]
+  },
+  "topics": [
+    {
+      "id": "mobile-role-collaboration",
+      "name": "移动端多角色业务协同管理系统",
+      "scoped_files": 16,
+      "allocated_files": 12,
+      "allocated_effective_lines": 3968,
+      "excluded_files": 4,
+      "excluded_pre_cutoff_or_partial": 0,
+      "excluded_prior_overlap": 2,
+      "excluded_candidate_duplicate": 2,
+      "meets_3000_effective_lines": true
+    },
+    {
+      "id": "channel-identity-verification",
+      "name": "渠道推广与身份核验管理系统",
+      "scoped_files": 21,
+      "allocated_files": 21,
+      "allocated_effective_lines": 4838,
+      "excluded_files": 0,
+      "excluded_pre_cutoff_or_partial": 0,
+      "excluded_prior_overlap": 0,
+      "excluded_candidate_duplicate": 0,
+      "meets_3000_effective_lines": true
+    },
+    {
+      "id": "electronic-agreement-compliance",
+      "name": "电子协议展示与合规授权管理系统",
+      "scoped_files": 27,
+      "allocated_files": 25,
+      "allocated_effective_lines": 4334,
+      "excluded_files": 2,
+      "excluded_pre_cutoff_or_partial": 0,
+      "excluded_prior_overlap": 0,
+      "excluded_candidate_duplicate": 2,
+      "meets_3000_effective_lines": true
+    }
+  ],
+  "candidate_totals": {
+    "audited_files": 64,
+    "allocated_files": 58,
+    "allocated_effective_lines": 13140
+  },
+  "outputs": {
+    "first_filing_snapshot": "first-filing-snapshot-files.csv",
+    "first_filing_shown_code": "first-filing-shown-code.csv",
+    "candidate_code_audit": "candidate-code-audit.csv"
+  }
+}
