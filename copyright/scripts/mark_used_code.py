@@ -7,6 +7,7 @@ then matches against repository files to mark them as "used".
 """
 
 import argparse
+import csv
 import hashlib
 import json
 import re
@@ -448,6 +449,98 @@ def get_used_files_report(commit_id: int) -> Dict:
     return {
         'total_used_files': len(rows),
         'by_copyright': by_copyright,
+    }
+
+
+def mark_used_paths_from_csv(
+    commit_id: int,
+    manifest_path: Path,
+    copyright_name: str,
+    path_column: str = 'path',
+) -> Dict:
+    """Mark exact repository paths from an evidence CSV as previously used.
+
+    A cell may contain multiple pipe-delimited paths.  Unlike fuzzy document
+    matching, this operation never infers a match from similar code.
+    """
+    with manifest_path.open('r', encoding='utf-8', newline='') as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames or path_column not in reader.fieldnames:
+            raise ValueError(
+                f"CSV column not found: {path_column}; "
+                f"available: {', '.join(reader.fieldnames or [])}"
+            )
+        requested_paths = []
+        for row in reader:
+            requested_paths.extend(
+                item.strip() for item in (row.get(path_column) or '').split('|') if item.strip()
+            )
+
+    requested_paths = sorted(set(requested_paths))
+    marked_files = []
+    unmatched_paths = []
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        for file_path in requested_paths:
+            cursor.execute(
+                "SELECT id, sha256 FROM files WHERE commit_id = ? AND file_path = ?",
+                (commit_id, file_path),
+            )
+            row = cursor.fetchone()
+            if not row:
+                unmatched_paths.append(file_path)
+                continue
+            file_id, file_sha256 = row
+            cursor.execute(
+                """
+                INSERT INTO used_files
+                (commit_id, file_id, copyright_name, source_document, match_type)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(commit_id, file_id, copyright_name) DO UPDATE SET
+                    source_document = excluded.source_document,
+                    match_type = excluded.match_type
+                """,
+                (
+                    commit_id,
+                    file_id,
+                    copyright_name,
+                    str(manifest_path),
+                    'manifest_path',
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO used_code_markers
+                (commit_id, file_id, copyright_name, source_document, code_hash)
+                SELECT ?, ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM used_code_markers
+                    WHERE commit_id = ? AND file_id = ? AND copyright_name = ?
+                      AND source_document = ? AND code_hash = ?
+                )
+                """,
+                (
+                    commit_id,
+                    file_id,
+                    copyright_name,
+                    str(manifest_path),
+                    file_sha256,
+                    commit_id,
+                    file_id,
+                    copyright_name,
+                    str(manifest_path),
+                    file_sha256,
+                ),
+            )
+            marked_files.append({'file_id': file_id, 'file_path': file_path})
+
+    return {
+        'manifest': str(manifest_path),
+        'copyright_name': copyright_name,
+        'path_column': path_column,
+        'requested_paths': len(requested_paths),
+        'marked_files': marked_files,
+        'unmatched_paths': unmatched_paths,
     }
 
 

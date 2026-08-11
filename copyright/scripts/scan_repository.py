@@ -75,6 +75,26 @@ def get_git_tracked_files(repo_path: Path) -> list:
     return [f for f in output.split('\n') if f]
 
 
+def get_commit_files(repo_path: Path, commit_hash: str) -> list:
+    """Get file paths from a committed tree, independent of the worktree."""
+    output = run_git_command(
+        ['ls-tree', '-r', '--name-only', commit_hash],
+        repo_path,
+    )
+    return [f for f in output.split('\n') if f]
+
+
+def read_commit_file(repo_path: Path, commit_hash: str, file_path: str) -> bytes:
+    """Read one file exactly as stored in a committed tree."""
+    result = subprocess.run(
+        ['git', 'show', f'{commit_hash}:{file_path}'],
+        cwd=str(repo_path),
+        capture_output=True,
+        check=True,
+    )
+    return result.stdout
+
+
 def should_exclude(file_path: str, exclude_dirs: set, exclude_patterns: list) -> bool:
     """Check if file should be excluded."""
     parts = Path(file_path).parts
@@ -117,6 +137,13 @@ def count_lines(file_path: Path) -> tuple:
         return total, effective
     except Exception:
         return 0, 0
+
+
+def count_content_lines(content: bytes) -> tuple:
+    """Count total and nonblank lines in committed file content."""
+    text = content.decode('utf-8', errors='ignore')
+    lines = text.splitlines()
+    return len(lines), sum(1 for line in lines if line.strip())
 
 
 def detect_language(file_path: str) -> str:
@@ -173,8 +200,10 @@ def scan_repository(
     # 获取或创建 commit 记录
     commit_id = get_or_create_commit(repo_id, commit_hash)
     
-    # 获取所有 git 跟踪的文件
-    tracked_files = get_git_tracked_files(repo_path)
+    # Always inspect the committed tree.  Reading the worktree here would make
+    # the recorded commit hash disagree with file hashes whenever local changes
+    # exist, and would make historical filing snapshots impossible to audit.
+    tracked_files = get_commit_files(repo_path, commit_hash)
     
     if verbose:
         print(f"Found {len(tracked_files)} tracked files")
@@ -184,8 +213,6 @@ def scan_repository(
     excluded = []
     
     for file_path in tracked_files:
-        full_path = repo_path / file_path
-        
         # 检查是否排除
         if should_exclude(file_path, exclude_dirs, exclude_patterns):
             excluded.append({
@@ -194,29 +221,26 @@ def scan_repository(
             })
             continue
         
-        # 检查文件是否存在
-        if not full_path.exists():
+        try:
+            content = read_commit_file(repo_path, commit_hash, file_path)
+        except subprocess.CalledProcessError:
             excluded.append({
                 'path': file_path,
-                'reason': 'file_not_found'
+                'reason': 'git_object_unreadable'
             })
             continue
-        
-        # 检查是否是文件
-        if not full_path.is_file():
-            continue
-        
+
         # 计算哈希
-        sha256 = calculate_sha256(full_path)
+        sha256 = hashlib.sha256(content).hexdigest()
         
         # 计算行数
-        total_lines, effective_lines = count_lines(full_path)
+        total_lines, effective_lines = count_content_lines(content)
         
         # 检测语言
         language = detect_language(file_path)
         
         # 获取文件大小
-        file_size = full_path.stat().st_size
+        file_size = len(content)
         
         # 插入数据库（幂等：重复扫描会更新而非报错）
         file_id = insert_file(
@@ -247,6 +271,8 @@ def scan_repository(
     
     return {
         'repository_id': repo_id,
+        'repo_name': repo_name,
+        'repo_path': str(repo_path.resolve()),
         'commit_id': commit_id,
         'commit_hash': commit_hash,
         'files': files,
@@ -271,6 +297,8 @@ def export_inventory(result: dict, output_dir: Path):
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump({
             'repository_id': result['repository_id'],
+            'repo_name': result.get('repo_name'),
+            'repo_path': result.get('repo_path'),
             'commit_id': result['commit_id'],
             'commit_hash': result['commit_hash'],
             'total_files': len(result['files']),

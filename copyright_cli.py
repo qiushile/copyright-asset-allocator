@@ -361,7 +361,11 @@ def cmd_material_audit(args):
 
 def cmd_mark_used(args):
     """Mark code from previous copyright documents as used."""
-    from mark_used_code import mark_used_code, get_used_files_report
+    from mark_used_code import (
+        get_used_files_report,
+        mark_used_code,
+        mark_used_paths_from_csv,
+    )
     import json
     
     scan_result_path = Path('copyright/inventory/scan-result.json')
@@ -398,6 +402,30 @@ def cmd_mark_used(args):
             for f in result['marked_files']:
                 print(f"    - {f['file_path']} (ratio: {f['match_ratio']:.1%})")
     
+    elif args.action == 'import':
+        manifest_path = Path(args.manifest)
+        if not manifest_path.exists():
+            print(f"Error: Manifest not found: {manifest_path}")
+            sys.exit(1)
+        try:
+            result = mark_used_paths_from_csv(
+                commit_id=scan_result['commit_id'],
+                manifest_path=manifest_path,
+                copyright_name=args.copyright_name,
+                path_column=args.path_column,
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            sys.exit(1)
+        print("\nExact-path import complete:")
+        print(f"  Manifest: {result['manifest']}")
+        print(f"  Requested paths: {result['requested_paths']}")
+        print(f"  Marked files: {len(result['marked_files'])}")
+        print(f"  Unmatched paths: {len(result['unmatched_paths'])}")
+        if result['unmatched_paths']:
+            for file_path in result['unmatched_paths']:
+                print(f"    - {file_path}")
+
     elif args.action == 'report':
         report = get_used_files_report(scan_result['commit_id'])
         print(f"\nUsed files report:")
@@ -754,6 +782,15 @@ Example workflow:
     mark_parser.add_argument('--threshold', type=float, default=0.6,
                             help='Match ratio threshold (default: 0.6)')
     mark_parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
+
+    mark_import_parser = mark_used_sub.add_parser(
+        'import', help='Import exact used paths from an evidence CSV')
+    mark_import_parser.add_argument('manifest', help='Path to CSV evidence manifest')
+    mark_import_parser.add_argument('--copyright-name', required=True,
+                                    help='Name of the previous copyright')
+    mark_import_parser.add_argument('--path-column', default='path',
+                                    help='CSV path column (pipe-delimited paths allowed)')
+    mark_import_parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     
     mark_report_parser = mark_used_sub.add_parser('report', help='Show used files report')
     mark_report_parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
