@@ -51,6 +51,12 @@ def make_git_repo(base: Path, name: str = "sample-repo") -> Path:
     run_git(repo, "config", "user.name", "Test Author")
     run_git(repo, "config", "user.email", "author@example.com")
     run_git(repo, "config", "commit.gpgsign", "false")
+    # Hermetic test repos: neutralize any user-global hooks (e.g. a global
+    # commit-msg hook enforcing Conventional Commits) so tests never depend
+    # on the host machine's git configuration.
+    hooks_dir = repo / ".test-hooks-disabled"
+    hooks_dir.mkdir(exist_ok=True)
+    run_git(repo, "config", "core.hooksPath", str(hooks_dir))
     return repo
 
 
