@@ -20,8 +20,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 from database import (
     init_database, get_connection, allocate_file,
     check_file_allocated, get_allocation, clear_allocations,
-    get_used_file_ids, get_team_eligible_file_ids
+    get_used_file_ids, get_team_eligible_file_ids,
+    get_commit_info, get_used_files_map, get_team_stats_map
 )
+
+# Team eligibility threshold used by analyze_ownership.py (team_ratio >= 0.5).
+TEAM_RATIO_THRESHOLD = 0.5
 
 
 def load_config(config_path: Path) -> dict:
@@ -230,6 +234,9 @@ def allocate_files_from_config(
         'skipped_used': [],
         'skipped_non_team': [],
         'reallocated': False,
+        'decisions': [],
+        'filters': {'skip_used': skip_used, 'skip_non_team': skip_non_team},
+        'commit_id': commit_id,
     }
     
     # 如果 force 模式，清除已有分配
@@ -253,6 +260,10 @@ def allocate_files_from_config(
         if team_eligible_ids is not None and verbose:
             print(f"Team eligibility active: {len(team_eligible_ids)} eligible files")
     
+    # Decision evidence 数据源：used 标记对应软著名 + 团队权属统计
+    used_files_map = get_used_files_map(commit_id) if skip_used else {}
+    team_stats_map = get_team_stats_map(commit_id) if skip_non_team else {}
+
     # 为每个软著创建记录
     copyright_db_ids = {}
     for cr_config in copyrights_config:
@@ -271,7 +282,37 @@ def allocate_files_from_config(
     for file in files:
         file_path = file['path']
         file_id = file['id']
-        
+
+        # 纯函数匹配集合：为每个文件都计算，保证 evidence 完整（不影响行为）
+        match = match_copyrights(file_path, copyrights_config)
+
+        team_stats = team_stats_map.get(file_id)
+        record = {
+            'path': file_path,
+            'file_id': file_id,
+            'sha256': file.get('sha256'),
+            'effective_lines': file.get('effective_lines', 0),
+            'eligibility': {
+                'used_before': file_id in used_file_ids,
+                'used_in': used_files_map.get(file_id),
+                'team_ratio': team_stats['team_ratio'] if team_stats else None,
+                'team_threshold': TEAM_RATIO_THRESHOLD,
+                'team_eligible': team_stats['is_eligible'] if team_stats else None,
+                'eligible': True,
+            },
+            'allocation': {
+                'matched_rules': match['matched_rules'],
+                'excluded_rules': match['excluded_rules'],
+                'decision': None,
+                'status': None,
+            },
+        }
+
+        def _finish(status: str, eligible: bool = True):
+            record['eligibility']['eligible'] = eligible
+            record['allocation']['status'] = status
+            results['decisions'].append(record)
+
         # Feature 1: 跳过已使用文件
         if skip_used and file_id in used_file_ids:
             results['skipped_used'].append({
@@ -279,10 +320,11 @@ def allocate_files_from_config(
                 'file_id': file_id,
                 'reason': 'used_in_previous_copyright',
             })
+            _finish('skipped_used', eligible=False)
             if verbose:
                 print(f"  ⊘ Skipped (used): {file_path}")
             continue
-        
+
         # Feature 2: 跳过非团队文件
         if team_eligible_ids is not None and file_id not in team_eligible_ids:
             results['skipped_non_team'].append({
@@ -290,10 +332,11 @@ def allocate_files_from_config(
                 'file_id': file_id,
                 'reason': 'not_team_eligible',
             })
+            _finish('skipped_non_team', eligible=False)
             if verbose:
                 print(f"  ⊘ Skipped (non-team): {file_path}")
             continue
-        
+
         # 检查是否已分配
         if check_file_allocated(commit_id, file_id):
             existing_cr = get_allocation(commit_id, file_id)
@@ -302,11 +345,11 @@ def allocate_files_from_config(
                 'file_id': file_id,
                 'reason': f'already_allocated_to_copyright_id_{existing_cr}'
             })
+            record['allocation']['detail'] = f'already_allocated_to_copyright_id_{existing_cr}'
+            _finish('already_allocated')
             continue
-        
-        # 计算完整匹配集合：0 -> 未分配，1 -> 分配，>1 -> 歧义（禁止按 YAML 顺序静默选择）
-        match = match_copyrights(file_path, copyrights_config)
 
+        # 匹配结果：0 -> 未分配，1 -> 分配，>1 -> 歧义（禁止按 YAML 顺序静默选择）
         if match['status'] == 'ambiguous':
             results['ambiguous'].append({
                 'file': file_path,
@@ -315,6 +358,7 @@ def allocate_files_from_config(
                 'matched_copyrights': match['matched_rules'],
                 'reason': 'multiple_copyrights_match',
             })
+            _finish('ambiguous')
             if verbose:
                 print(f"  ⚠ AMBIGUOUS {file_path} matches: {', '.join(match['matched_rules'])}")
             continue
@@ -325,12 +369,15 @@ def allocate_files_from_config(
                 'file_id': file_id,
                 'effective_lines': file.get('effective_lines', 0),
             })
+            _finish('unallocated')
             continue
 
         cr_id = match['decision']
         db_id = copyright_db_ids[cr_id]
         if allocate_file(commit_id, file_id, db_id):
             results['allocations'][cr_id].append(file)
+            record['allocation']['decision'] = cr_id
+            _finish('allocated')
             if verbose:
                 print(f"  ✓ {file_path} -> {cr_id}")
         else:
@@ -339,6 +386,8 @@ def allocate_files_from_config(
                 'file_id': file_id,
                 'reason': f'conflict_allocating_to_{cr_id}'
             })
+            record['allocation']['detail'] = f'conflict_allocating_to_{cr_id}'
+            _finish('conflict')
 
     return results
 
@@ -395,6 +444,20 @@ def export_allocations(results: dict, output_dir: Path, copyrights_config: list)
         with open(skipped_path, 'w', encoding='utf-8') as f:
             json.dump(skipped, f, indent=2, ensure_ascii=False)
     
+    # 生成 decision evidence：每个文件的 eligibility + allocation 判定依据
+    decisions_path = output_dir / 'allocation-decisions.json'
+    commit_info = get_commit_info(results.get('commit_id')) if results.get('commit_id') else None
+    with open(decisions_path, 'w', encoding='utf-8') as f:
+        json.dump({
+            'commit_id': results.get('commit_id'),
+            'commit_hash': commit_info['commit_hash'] if commit_info else None,
+            'repository': commit_info['repository'] if commit_info else None,
+            'filters': results.get('filters', {}),
+            'team_threshold': TEAM_RATIO_THRESHOLD,
+            'file_count': len(results['decisions']),
+            'decisions': results['decisions'],
+        }, f, indent=2, ensure_ascii=False)
+
     # 生成汇总报告
     summary_path = output_dir / 'allocation-summary.json'
     with open(summary_path, 'w', encoding='utf-8') as f:

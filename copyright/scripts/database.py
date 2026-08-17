@@ -418,6 +418,47 @@ def get_team_eligible_file_ids(commit_id: int) -> Optional[set]:
         return set(row[0] for row in cursor.fetchall())
 
 
+def get_commit_info(commit_id: int) -> Optional[dict]:
+    """Get commit hash / repository info for evidence records."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT c.commit_hash, r.name, r.path
+            FROM commits c
+            JOIN repositories r ON r.id = c.repository_id
+            WHERE c.id = ?
+        """, (commit_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        return {'commit_hash': row[0], 'repository': row[1], 'repository_path': row[2]}
+
+
+def get_used_files_map(commit_id: int) -> dict:
+    """Map file_id -> list of copyright names that previously used the file."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT file_id, copyright_name FROM used_files WHERE commit_id = ?
+        """, (commit_id,))
+        result = {}
+        for file_id, copyright_name in cursor.fetchall():
+            result.setdefault(file_id, []).append(copyright_name)
+        return result
+
+
+def get_team_stats_map(commit_id: int) -> dict:
+    """Map file_id -> team ownership stats. Empty dict if analysis not done."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT file_id, team_ratio, is_eligible FROM file_team_stats
+            WHERE commit_id = ?
+        """, (commit_id,))
+        return {row[0]: {'team_ratio': row[1], 'is_eligible': bool(row[2])}
+                for row in cursor.fetchall()}
+
+
 def set_project_setting(key: str, value: str):
     """Set a project-level setting."""
     with get_connection() as conn:
