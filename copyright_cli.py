@@ -111,7 +111,29 @@ def cmd_allocate(args):
     )
     
     export_allocations(results, Path('copyright/allocations'), config['copyrights'])
-    
+
+    # Run manifest: record commit + config + rules + filters for reproducibility.
+    # Only written when the run did not hit ambiguity (ambiguous runs allocate
+    # nothing and must not leave a manifest that later audits could reference).
+    if not results.get('ambiguous'):
+        from run_manifest import write_run_manifest, DEFAULT_CONFIG_PATH, DEFAULT_REQUIREMENTS_PATH
+        from database import get_since_date
+        manifest = write_run_manifest(
+            commit_id=scan_result['commit_id'],
+            commit_hash=scan_result['commit_hash'],
+            repository=scan_result.get('repo_path'),
+            config_path=config_path,
+            requirements_path=DEFAULT_REQUIREMENTS_PATH,
+            filters={
+                'skip_used': not args.no_skip_used,
+                'skip_non_team': not args.no_skip_non_team,
+            },
+            since=get_since_date(),
+        )
+        if args.verbose:
+            print(f"  Run manifest: copyright/inventory/run-manifest.json "
+                  f"(config sha256={manifest['config']['sha256'][:12]}...)")
+
     print(f"\nAllocation complete:")
     if results.get('reallocated'):
         print("  (Re-allocation: cleared previous assignments)")

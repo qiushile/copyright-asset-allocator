@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from database import init_database, get_connection
+from run_manifest import ManifestCommitMismatch, require_commit_consistency
 
 
 def get_repository_info(commit_id: int) -> dict:
@@ -92,6 +93,49 @@ def verify_file_hash(file_path: Path, expected_sha256: str) -> bool:
     return sha256.hexdigest() == expected_sha256
 
 
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def safe_workspace_path(source_dir: Path, rel_path: str) -> Path:
+    """Join ``rel_path`` onto ``source_dir`` refusing traversal/absolute paths.
+
+    Guarantees the resolved destination stays inside ``source_dir`` even for
+    hostile path values (``../``, absolute paths).  Symlinked components in
+    the destination root are resolved before the containment check.
+    """
+    rel = Path(rel_path)
+    if rel.is_absolute() or '..' in rel.parts or str(rel_path).startswith('\\\\'):
+        raise ValueError(f"Unsafe file path rejected: {rel_path!r}")
+    root = source_dir.resolve()
+    candidate = (source_dir / rel).resolve()
+    if candidate != root and root not in candidate.parents:
+        raise ValueError(f"Path escapes workspace root: {rel_path!r}")
+    return candidate
+
+
+def read_locked_commit_file(repo_path: Path, commit_hash: str, file_path: str) -> bytes:
+    """Read file content from the LOCKED commit (never the working tree).
+
+    This keeps workspace builds reproducible: even if HEAD or the working
+    tree moved after the scan, the workspace contains exactly the bytes of
+    the audited commit.
+    """
+    import subprocess
+    result = subprocess.run(
+        ['git', 'show', f'{commit_hash}:{file_path}'],
+        cwd=str(repo_path),
+        capture_output=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        raise FileNotFoundError(
+            f"Cannot read {file_path} at commit {commit_hash}: "
+            f"{result.stderr.decode('utf-8', 'replace').strip()}"
+        )
+    return result.stdout
+
+
 def build_workspace(
     commit_id: int,
     copyright_id: str,
@@ -111,7 +155,13 @@ def build_workspace(
     repo_info = get_repository_info(commit_id)
     cr_info = get_copyright_info(commit_id, copyright_id)
     files = get_allocated_files(commit_id, cr_info['db_id'])
-    
+
+    # Git 真实性: 工作区必须与 run manifest 锁定的 commit 一致（若存在 manifest）
+    require_commit_consistency(
+        repo_info['commit_hash'],
+        context=f"workspace build for {copyright_id}",
+    )
+
     repo_path = Path(repo_info['repo_path'])
     workspace_dir = output_base / copyright_id
     source_dir = workspace_dir / 'source'
@@ -134,31 +184,38 @@ def build_workspace(
     errors = []
     
     for file in files:
-        src_path = repo_path / file['path']
-        dst_path = source_dir / file['path']
-        
-        # 检查源文件存在
-        if not src_path.exists():
+        # 路径边界: 拒绝任何会逃出 source/ 根目录的目标路径
+        try:
+            dst_path = safe_workspace_path(source_dir, file['path'])
+        except ValueError as exc:
+            errors.append({'file': file['path'], 'error': 'unsafe_path',
+                           'message': str(exc)})
+            continue
+
+        # 内容来源: 锁定 Commit（git show），而非工作区当前状态
+        try:
+            content = read_locked_commit_file(repo_path, repo_info['commit_hash'], file['path'])
+        except (FileNotFoundError, OSError) as exc:
             errors.append({
                 'file': file['path'],
-                'error': 'source_file_missing'
+                'error': 'git_object_unreadable',
+                'message': str(exc),
             })
             continue
-        
-        # 验证哈希
-        if verify_hashes and not verify_file_hash(src_path, file['sha256']):
+
+        # 验证哈希（对锁定 Commit 读出的字节再次核验，纵深防御）
+        if verify_hashes and sha256_bytes(content) != file['sha256']:
             errors.append({
                 'file': file['path'],
                 'error': 'hash_mismatch',
                 'expected': file['sha256'],
             })
             continue
-        
-        # 创建目标目录
+
+        # 创建目标目录并写入字节（不复制工作区文件，符号链接也被中和为普通文件）
         dst_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # 复制文件
-        shutil.copy2(src_path, dst_path)
+        with open(dst_path, 'wb') as out:
+            out.write(content)
         
         manifest_files.append({
             'path': file['path'],

@@ -17,6 +17,7 @@ from material_requirements import (
     load_material_requirements,
     requirement_summary,
 )
+from run_manifest import load_run_manifest
 from validate_materials import audit_material_directory
 
 
@@ -62,6 +63,42 @@ def audit_commit(
                     'details': asset,
                 })
     
+    # Run manifest: 最终审计必须能追溯到产生分配的 commit + 配置
+    manifest = load_run_manifest()
+    if manifest is None:
+        results['run_manifest'] = {'found': False}
+        results['warnings'].append({
+            'type': 'run_manifest_missing',
+            'message': 'run-manifest.json not found; allocation provenance '
+                       '(commit/config/filters) cannot be verified',
+        })
+    else:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT commit_hash FROM commits WHERE id = ?", (commit_id,)
+            ).fetchone()
+        audited_commit = row[0] if row else None
+        manifest_commit = manifest.get('commit_hash')
+        commit_match = bool(audited_commit) and audited_commit == manifest_commit
+        results['run_manifest'] = {
+            'found': True,
+            'tool_version': manifest.get('tool_version'),
+            'commit_hash': manifest_commit,
+            'config_sha256': (manifest.get('config') or {}).get('sha256'),
+            'commit_match': commit_match,
+        }
+        if not commit_match:
+            results['passed'] = False
+            results['errors'].append({
+                'type': 'run_manifest_commit_mismatch',
+                'manifest_commit': manifest_commit,
+                'audited_commit': audited_commit,
+                'message': (
+                    f'run manifest was produced for commit {manifest_commit}, '
+                    f'but the audited commit is {audited_commit}'
+                ),
+            })
+
     with get_connection() as conn:
         cursor = conn.cursor()
         
