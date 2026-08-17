@@ -73,6 +73,87 @@ def should_include_file(file_path: str, include_paths: list, exclude_paths: list
     return False
 
 
+class ConfigError(ValueError):
+    """Raised when copyrights.yaml is structurally invalid."""
+
+
+def validate_copyrights_config(config: dict) -> list:
+    """
+    Validate the loaded copyrights.yaml structure.
+
+    Raises ConfigError with an actionable message, e.g.
+    ``copyrights[1].version is required``.  Returns the copyright list.
+    """
+    if not isinstance(config, dict):
+        raise ConfigError("copyrights.yaml: top level must be a mapping")
+    copyrights = config.get('copyrights')
+    if not isinstance(copyrights, list) or not copyrights:
+        raise ConfigError("copyrights.yaml: 'copyrights' list is required and must be non-empty")
+
+    seen_ids = {}
+    for index, cr in enumerate(copyrights):
+        if not isinstance(cr, dict):
+            raise ConfigError(f"copyrights[{index}] must be a mapping")
+        for key in ('id', 'name', 'version'):
+            if not cr.get(key):
+                raise ConfigError(f"copyrights[{index}].{key} is required")
+        include_paths = cr.get('include_paths', [])
+        if not isinstance(include_paths, list) or not include_paths:
+            raise ConfigError(
+                f"copyrights[{index}].include_paths is required and must be a non-empty list"
+            )
+        for key in ('include_paths', 'exclude_paths'):
+            patterns = cr.get(key, [])
+            if not isinstance(patterns, list) or not all(isinstance(x, str) for x in patterns):
+                raise ConfigError(f"copyrights[{index}].{key} must be a list of glob strings")
+        cr_id = cr['id']
+        if cr_id in seen_ids:
+            raise ConfigError(
+                f"copyrights[{index}].id '{cr_id}' duplicates copyrights[{seen_ids[cr_id]}].id"
+            )
+        seen_ids[cr_id] = index
+    return copyrights
+
+
+def match_copyrights(file_path: str, copyrights_config: list) -> dict:
+    """
+    Compute the FULL set of copyrights whose rules match ``file_path``.
+
+    Returns a decision record:
+
+        {
+            'matched_rules': [...],    # copyrights whose include patterns match
+            'excluded_rules': [...],   # copyrights whose exclude patterns match
+            'decision': cr_id | None,
+            'status': 'allocated' | 'unallocated' | 'ambiguous',
+        }
+
+    A file matched by more than one copyright is AMBIGUOUS.  YAML ordering is
+    never used as a tie-breaker (no implicit priority).
+    """
+    matched = []
+    excluded = []
+    for cr_config in copyrights_config:
+        cr_id = cr_config['id']
+        include_paths = cr_config.get('include_paths', [])
+        exclude_paths = cr_config.get('exclude_paths', [])
+
+        if any(match_path(file_path, pattern) for pattern in exclude_paths):
+            excluded.append(cr_id)
+            continue
+        if any(match_path(file_path, pattern) for pattern in include_paths):
+            matched.append(cr_id)
+
+    if len(matched) == 1:
+        return {'matched_rules': matched, 'excluded_rules': excluded,
+                'decision': matched[0], 'status': 'allocated'}
+    if len(matched) > 1:
+        return {'matched_rules': matched, 'excluded_rules': excluded,
+                'decision': None, 'status': 'ambiguous'}
+    return {'matched_rules': matched, 'excluded_rules': excluded,
+            'decision': None, 'status': 'unallocated'}
+
+
 def create_copyright(commit_id: int, copyright_id: str, name: str, version: str, description: str) -> int:
     """Create copyright record in database (idempotent)."""
     with get_connection() as conn:
@@ -133,11 +214,17 @@ def allocate_files_from_config(
         skip_non_team: If True, skip files not primarily written by team
     
     Returns:
-        dict with allocation results and conflicts
+        dict with allocation results, ambiguous files and conflicts
+
+    Raises:
+        ConfigError: if copyrights_config is structurally invalid.
     """
+    validate_copyrights_config({'copyrights': copyrights_config})
+
     results = {
         'allocations': {},
         'unallocated': [],
+        'ambiguous': [],
         'conflicts': [],
         'excluded': [],
         'skipped_used': [],
@@ -217,37 +304,42 @@ def allocate_files_from_config(
             })
             continue
         
-        # 尝试匹配到软著
-        allocated = False
-        for cr_config in copyrights_config:
-            cr_id = cr_config['id']
-            include_paths = cr_config.get('include_paths', [])
-            exclude_paths = cr_config.get('exclude_paths', [])
-            
-            if should_include_file(file_path, include_paths, exclude_paths):
-                db_id = copyright_db_ids[cr_id]
-                if allocate_file(commit_id, file_id, db_id):
-                    results['allocations'][cr_id].append(file)
-                    allocated = True
-                    if verbose:
-                        print(f"  ✓ {file_path} -> {cr_id}")
-                    break
-                else:
-                    results['conflicts'].append({
-                        'file': file_path,
-                        'file_id': file_id,
-                        'reason': f'conflict_allocating_to_{cr_id}'
-                    })
-                    allocated = True  # 已处理（冲突）
-                    break
-        
-        if not allocated:
+        # 计算完整匹配集合：0 -> 未分配，1 -> 分配，>1 -> 歧义（禁止按 YAML 顺序静默选择）
+        match = match_copyrights(file_path, copyrights_config)
+
+        if match['status'] == 'ambiguous':
+            results['ambiguous'].append({
+                'file': file_path,
+                'file_id': file_id,
+                'effective_lines': file.get('effective_lines', 0),
+                'matched_copyrights': match['matched_rules'],
+                'reason': 'multiple_copyrights_match',
+            })
+            if verbose:
+                print(f"  ⚠ AMBIGUOUS {file_path} matches: {', '.join(match['matched_rules'])}")
+            continue
+
+        if match['status'] == 'unallocated':
             results['unallocated'].append({
                 'file': file_path,
                 'file_id': file_id,
                 'effective_lines': file.get('effective_lines', 0),
             })
-    
+            continue
+
+        cr_id = match['decision']
+        db_id = copyright_db_ids[cr_id]
+        if allocate_file(commit_id, file_id, db_id):
+            results['allocations'][cr_id].append(file)
+            if verbose:
+                print(f"  ✓ {file_path} -> {cr_id}")
+        else:
+            results['conflicts'].append({
+                'file': file_path,
+                'file_id': file_id,
+                'reason': f'conflict_allocating_to_{cr_id}'
+            })
+
     return results
 
 
@@ -284,6 +376,12 @@ def export_allocations(results: dict, output_dir: Path, copyrights_config: list)
         with open(unallocated_path, 'w', encoding='utf-8') as f:
             json.dump(results['unallocated'], f, indent=2, ensure_ascii=False)
     
+    # 生成歧义文件报告（多个软著同时匹配，禁止静默选择）
+    if results.get('ambiguous'):
+        ambiguous_path = output_dir / 'ambiguous-files.json'
+        with open(ambiguous_path, 'w', encoding='utf-8') as f:
+            json.dump(results['ambiguous'], f, indent=2, ensure_ascii=False)
+
     # 生成冲突报告
     if results['conflicts']:
         conflict_path = output_dir / 'allocation-conflicts.json'
@@ -304,6 +402,7 @@ def export_allocations(results: dict, output_dir: Path, copyrights_config: list)
             'total_copyrights': len(copyrights_config),
             'total_allocated': sum(len(files) for files in results['allocations'].values()),
             'total_unallocated': len(results['unallocated']),
+            'total_ambiguous': len(results.get('ambiguous', [])),
             'total_conflicts': len(results['conflicts']),
             'total_skipped_used': len(results.get('skipped_used', [])),
             'total_skipped_non_team': len(results.get('skipped_non_team', [])),
@@ -344,7 +443,12 @@ def main():
         sys.exit(1)
     
     config = load_config(args.config)
-    
+    try:
+        validate_copyrights_config(config)
+    except ConfigError as exc:
+        print(f"Error: invalid config {args.config}: {exc}")
+        sys.exit(1)
+
     # 加载扫描结果
     if not args.scan_result.exists():
         print(f"Error: Scan result not found: {args.scan_result}")
@@ -396,6 +500,13 @@ def main():
     if results['conflicts']:
         print(f"\n  Conflicts: {len(results['conflicts'])} files")
         print(f"  See: {args.output}/allocation-conflicts.json")
+
+    if results.get('ambiguous'):
+        print(f"\n  ERROR: {len(results['ambiguous'])} files matched more than one copyright.")
+        print(f"  Ambiguous files were NOT allocated; YAML ordering is never used as a tie-breaker.")
+        print(f"  Narrow include_paths/exclude_paths so each file matches exactly one copyright.")
+        print(f"  See: {args.output}/ambiguous-files.json")
+        sys.exit(1)
 
 
 if __name__ == '__main__':

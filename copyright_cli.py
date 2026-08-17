@@ -71,7 +71,13 @@ def cmd_scan(args):
 
 def cmd_allocate(args):
     """Allocate files to copyrights."""
-    from allocate_files import load_config, allocate_files_from_config, export_allocations
+    from allocate_files import (
+        ConfigError,
+        allocate_files_from_config,
+        export_allocations,
+        load_config,
+        validate_copyrights_config,
+    )
     import json
     
     scan_result_path = Path('copyright/inventory/scan-result.json')
@@ -88,9 +94,10 @@ def cmd_allocate(args):
         sys.exit(1)
     
     config = load_config(config_path)
-    
-    if 'copyrights' not in config or not config['copyrights']:
-        print("Error: No copyrights defined in config file.")
+    try:
+        validate_copyrights_config(config)
+    except ConfigError as exc:
+        print(f"Error: invalid config {config_path}: {exc}")
         sys.exit(1)
     
     results = allocate_files_from_config(
@@ -127,6 +134,17 @@ def cmd_allocate(args):
         print(f"\n  Conflicts: {len(results['conflicts'])} files (already allocated)")
         if not args.force:
             print("  Tip: Use --force to clear and re-allocate")
+
+    if results.get('ambiguous'):
+        print(f"\n  ERROR: {len(results['ambiguous'])} files matched more than one copyright:")
+        for item in results['ambiguous'][:10]:
+            print(f"    {item['file']} -> {', '.join(item['matched_copyrights'])}")
+        if len(results['ambiguous']) > 10:
+            print(f"    ... and {len(results['ambiguous']) - 10} more")
+        print("  Ambiguous files were NOT allocated (YAML ordering is never a tie-breaker).")
+        print("  Narrow include_paths/exclude_paths so each file matches exactly one copyright.")
+        print("  See: copyright/allocations/ambiguous-files.json")
+        sys.exit(1)
 
 
 def cmd_validate(args):
