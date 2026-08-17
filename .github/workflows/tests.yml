@@ -1,0 +1,72 @@
+name: Tests
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+# 测试拆分为两个职责明确的作业：
+#   core      —— 核心资产引擎（扫描/数据库/分配/权属/拆分/重合/manifest），不渲染 PDF
+#   materials —— 材料生成与渲染后审计（Markdown -> PDF -> rendered audit），需要 WeasyPrint 运行环境
+# 两个作业在 Python 3.11 / 3.12 矩阵上运行；合计覆盖 tests/ 全量测试。
+#
+# 注意：WeasyPrint 需要系统级 pango/ffi 库与 CJK 字体。这里显式安装，
+# 不允许通过 skip 掩盖材料测试失败。
+
+jobs:
+  core:
+    name: Core engine (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-22.04  # 22.04 的 pango 包名稳定；24.04 存在 t64 改名
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+      - name: Run core engine tests
+        run: >
+          pytest tests/ -q
+          --ignore=tests/test_material_documents.py
+          --ignore=tests/test_material_audit.py
+          --ignore=tests/test_cli_material_commands.py
+
+  materials:
+    name: Materials pipeline (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install WeasyPrint system dependencies and CJK fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpango-1.0-0 \
+            libpangoft2-1.0-0 \
+            libpangocairo-1.0-0 \
+            libgdk-pixbuf-2.0-0 \
+            libcairo2 \
+            libffi-dev \
+            fonts-noto-cjk
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+      - name: Run material generation and rendered-audit tests
+        run: >
+          pytest -q
+          tests/test_material_documents.py
+          tests/test_material_audit.py
+          tests/test_cli_material_commands.py

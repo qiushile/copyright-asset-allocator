@@ -1,0 +1,30 @@
+# 工程化配置（过渡阶段）。
+#
+# 当前仓库仍以 `python copyright_cli.py ...` 为入口，脚本位于
+# copyright/scripts/。本文件只声明项目元数据与 pytest 配置，
+# 不引入构建/打包流程；src/ 包化改造在后续迭代完成。
+#
+# 运行时依赖的权威清单仍是 requirements.txt（CI 与本地安装均使用它），
+# 此处的 dependencies 仅作元数据镜像，修改依赖时两处需保持一致。
+
+[project]
+name = "copyright-asset-allocator"
+version = "1.1.0"
+description = "软著代码资产分配系统：扫描、权属核验、唯一分配、重合检测、材料生成与审计"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "PyYAML>=6.0",
+    "python-docx>=1.1.0",
+    "pypdf>=5.0.0",
+    "pdfplumber>=0.11.0",
+    "weasyprint>=66.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
