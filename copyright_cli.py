@@ -628,16 +628,20 @@ def cmd_auto_split(args):
         verbose=args.verbose,
     )
     
-    if result.get('error'):
-        print(f"Error: {result['error']}")
+    # Always export the report (evidence), even when the split failed.
+    output_report = Path(args.output_report)
+    export_split_report(result, output_report)
+
+    if result.get('status') != 'ok':
+        from auto_split import _print_failure
+        _print_failure(result)
+        print(f"\n  Report: {output_report}")
+        print("  No config was written.")
         sys.exit(1)
-    
+
     repo_name = scan_result.get('repo_name', 'my-project')
     output_config = Path(args.output_config)
     yaml_str = generate_config_yaml(result, repo_name, output_config)
-    
-    output_report = Path(args.output_report)
-    export_split_report(result, output_report)
     
     print(f"\n{'=' * 60}")
     print(f"Auto-Split Complete")

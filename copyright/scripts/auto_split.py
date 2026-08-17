@@ -81,33 +81,46 @@ def compute_module_stats(modules: Dict[str, List[Dict]]) -> List[Dict]:
 # Splitting Algorithm
 # ============================================================
 
-def estimate_copyright_count(total_lines: int, min_lines: int, max_lines: int = 0) -> int:
-    """Estimate how many copyrights to create.
-    
-    Args:
-        total_lines: Total effective lines available
-        min_lines: Minimum lines per copyright (default 3000)
-        max_lines: Maximum lines per copyright (0 = no limit, suggested ~15000)
+def feasible_count_range(total_lines: int, min_lines: int, max_lines: int = 0):
+    """Compute the feasible range of copyright counts for the given bounds.
+
+    A count ``n`` is feasible only if every copyright can hold between
+    ``min_lines`` and ``max_lines`` effective lines:
+
+        n * min_lines <= total_lines            ->  n <= total // min_lines
+        n * max_lines >= total_lines (max > 0)  ->  n >= ceil(total / max_lines)
+
+    Returns ``(low, high)`` or ``None`` when no count can satisfy the bounds
+    (including the ``total_lines < min_lines`` case).
     """
-    if total_lines < min_lines:
-        return 1  # Not enough for even one, still create one
-    
-    if max_lines > 0:
-        # Use max_lines to determine upper bound
-        n_by_max = math.ceil(total_lines / max_lines)
-        n_by_min = total_lines // min_lines
-        # Choose a count between these bounds
-        return max(1, min(n_by_min, max(n_by_max, n_by_min)))
-    
-    # Default: aim for ~5000-8000 lines per copyright
-    target_lines = 6000
-    n = max(1, round(total_lines / target_lines))
-    
-    # Ensure each copyright can meet minimum
-    while n > 1 and total_lines / n < min_lines:
-        n -= 1
-    
-    return n
+    if min_lines <= 0 or total_lines < min_lines:
+        return None
+    high = total_lines // min_lines
+    low = math.ceil(total_lines / max_lines) if max_lines and max_lines > 0 else 1
+    if low > high:
+        return None
+    return (low, high)
+
+
+def estimate_copyright_count(total_lines: int, min_lines: int, max_lines: int = 0) -> int:
+    """Recommend how many copyrights to create.
+
+    Returns 0 when the constraints are infeasible (never silently emits an
+    undersized copyright).  The recommendation aims for the middle of the
+    allowed size band: ``(min_lines + max_lines) / 2`` when ``max_lines`` is
+    set, otherwise the legacy ~6000-line target, always clamped into the
+    feasible range.
+    """
+    rng = feasible_count_range(total_lines, min_lines, max_lines)
+    if rng is None:
+        return 0
+    low, high = rng
+    if max_lines and max_lines > 0:
+        target_lines = (min_lines + max_lines) / 2.0
+    else:
+        target_lines = 6000.0
+    n = int(round(total_lines / target_lines))
+    return max(low, min(high, n))
 
 
 def greedy_bin_pack(
@@ -166,19 +179,25 @@ def greedy_bin_pack(
     return [b['modules'] for b in final_bins]
 
 
-def try_split_large_modules(
+def split_oversized_modules(
     module_stats: List[Dict],
-    n_copyrights: int,
-    min_lines: int = 3000
-) -> List[List[Dict]]:
-    """Try a more aggressive split: split large modules by sub-directory.
-    
-    If a single module has enough lines, split it into sub-modules.
+    min_lines: int = 3000,
+    max_lines: int = 0,
+) -> List[Dict]:
+    """Split modules that are too large for a single copyright bin.
+
+    A module is split by sub-directory (one level deeper) when it exceeds the
+    split threshold: ``max_lines`` when set (it could never fit one copyright
+    bin), otherwise the legacy ``min_lines * 2`` heuristic.  Modules that
+    cannot be split further are returned unchanged; callers must report them
+    as ``oversized_atomic_module`` violations when they still exceed
+    ``max_lines``.
     """
+    threshold = max_lines if max_lines and max_lines > 0 else min_lines * 2
     expanded_modules = []
-    
+
     for module in module_stats:
-        if module['total_lines'] > min_lines * 2 and len(module['files']) > 5:
+        if module['total_lines'] > threshold and len(module['files']) > 5:
             # Try splitting by sub-directory (depth + 1)
             sub_groups = defaultdict(list)
             for f in module['files']:
@@ -190,7 +209,7 @@ def try_split_large_modules(
                 else:
                     sub_key = module['module']
                 sub_groups[sub_key].append(f)
-            
+
             if len(sub_groups) > 1:
                 for sub_key, sub_files in sub_groups.items():
                     sub_lines = sum(f.get('effective_lines', 0) for f in sub_files)
@@ -204,9 +223,66 @@ def try_split_large_modules(
                 expanded_modules.append(module)
         else:
             expanded_modules.append(module)
-    
+
     expanded_modules.sort(key=lambda x: x['total_lines'], reverse=True)
-    return greedy_bin_pack(expanded_modules, n_copyrights, min_lines)
+    return expanded_modules
+
+
+def _bin_lines(bin_modules: List[Dict]) -> int:
+    return sum(m['total_lines'] for m in bin_modules)
+
+
+def pack_within_bounds(
+    module_stats: List[Dict],
+    n_copyrights: int,
+    min_lines: int = 3000,
+    max_lines: int = 0,
+) -> Tuple[List[List[Dict]], List[Dict], int]:
+    """Bin-pack modules while enforcing ``min_lines`` and ``max_lines``.
+
+    Strategy:
+    1. Split modules that exceed the size threshold by sub-directory.
+    2. Greedy LPT packing into ``n_copyrights`` bins, merging underflow bins.
+    3. While any bin exceeds ``max_lines`` and more bins are allowed by
+       ``min_lines`` (i.e. bin count < total // min_lines), add a bin and
+       repack.
+    4. Whatever still violates ``max_lines`` is reported, never silently
+       accepted.
+
+    Returns ``(bins, violations, actual_bin_count_attempted)`` where each bin
+    is a list of module_stats entries.
+    """
+    n_high = sum(m['total_lines'] for m in module_stats) // min_lines if min_lines > 0 else 0
+    candidate_modules = split_oversized_modules(module_stats, min_lines, max_lines)
+
+    attempt = max(1, n_copyrights)
+    while True:
+        bins = greedy_bin_pack(candidate_modules, attempt, min_lines)
+        if not max_lines or max_lines <= 0:
+            return bins, [], attempt
+        overflowing = [b for b in bins if _bin_lines(b) > max_lines]
+        if not overflowing:
+            return bins, [], attempt
+        if attempt < max(attempt, n_high):
+            attempt += 1
+            continue
+        # Cannot add more bins without breaking min_lines -- report the cause.
+        violations = []
+        for module in candidate_modules:
+            if module['total_lines'] > max_lines:
+                violations.append({
+                    'type': 'oversized_atomic_module',
+                    'module': module['module'],
+                    'total_lines': module['total_lines'],
+                    'max_lines': max_lines,
+                })
+        if not violations:
+            violations.append({
+                'type': 'max_lines_exceeded',
+                'max_lines': max_lines,
+                'overflowing_bins': [_bin_lines(b) for b in overflowing],
+            })
+        return bins, violations, attempt
 
 
 # ============================================================
@@ -339,6 +415,13 @@ def auto_split(
     if not eligible_files:
         return {
             'copyrights': [],
+            'status': 'infeasible',
+            'requested_count': n_copyrights if n_copyrights > 0 else None,
+            'feasible_count': 0,
+            'feasible_range': None,
+            'reason': 'no_eligible_files',
+            'min_lines': min_lines,
+            'max_lines': max_lines,
             'total_files': 0,
             'total_lines': 0,
             'skipped_used': skipped_used,
@@ -352,37 +435,100 @@ def auto_split(
     if verbose:
         print(f"Total effective lines: {total_lines}")
     
-    # 5. Determine number of copyrights
-    if n_copyrights > 0:
-        n = n_copyrights
-    else:
-        n = estimate_copyright_count(total_lines, min_lines, max_lines)
-    
+    # 5. Feasibility: explicit count bounds instead of silent degradation
+    base_result = {
+        'min_lines': min_lines,
+        'max_lines': max_lines,
+        'total_files': len(eligible_files),
+        'total_lines': total_lines,
+        'skipped_used': skipped_used,
+        'skipped_non_team': skipped_non_team,
+    }
+
+    rng = feasible_count_range(total_lines, min_lines, max_lines)
+    if rng is None:
+        reason = ('insufficient_eligible_code' if total_lines < min_lines
+                  else 'min_max_constraints_conflict')
+        result = dict(base_result)
+        result.update({
+            'copyrights': [],
+            'status': 'infeasible',
+            'requested_count': n_copyrights if n_copyrights > 0 else None,
+            'feasible_count': 0,
+            'feasible_range': None,
+            'reason': reason,
+        })
+        return result
+    low, high = rng
+
+    if n_copyrights > 0 and not (low <= n_copyrights <= high):
+        if n_copyrights > high:
+            reason = 'insufficient_eligible_code'
+            feasible = high
+        else:
+            reason = 'max_lines_requires_more_copyrights'
+            feasible = low
+        result = dict(base_result)
+        result.update({
+            'copyrights': [],
+            'status': 'infeasible',
+            'requested_count': n_copyrights,
+            'feasible_count': feasible,
+            'feasible_range': [low, high],
+            'reason': reason,
+        })
+        return result
+
+    n = n_copyrights if n_copyrights > 0 else estimate_copyright_count(
+        total_lines, min_lines, max_lines)
+
     if verbose:
-        print(f"Target copyrights: {n}")
-    
+        print(f"Target copyrights: {n} (feasible range: {low}-{high})")
+
     # 6. Group by module
     modules = group_files_by_module(eligible_files, depth=module_depth)
     module_stats = compute_module_stats(modules)
-    
+
     if verbose:
         print(f"Modules found: {len(module_stats)}")
         for ms in module_stats[:10]:
             print(f"  {ms['module']}: {ms['file_count']} files, {ms['total_lines']} lines")
         if len(module_stats) > 10:
             print(f"  ... and {len(module_stats) - 10} more")
-    
-    # 7. Bin-pack
-    if n == 1:
-        bins = [module_stats]
-    else:
-        # Try aggressive split first if modules are large
-        bins = try_split_large_modules(module_stats, n, min_lines)
-        
-        # If we got fewer bins than requested, try standard packing
-        if len(bins) < n and len(module_stats) >= n:
-            bins = greedy_bin_pack(module_stats, n, min_lines)
-    
+
+    # 7. Bin-pack with min/max enforcement (never silently ignores max_lines)
+    bins, violations, attempted = pack_within_bounds(
+        module_stats, n, min_lines, max_lines)
+
+    if violations:
+        result = dict(base_result)
+        result.update({
+            'copyrights': [],
+            'status': 'constraint_violation',
+            'requested_count': n_copyrights if n_copyrights > 0 else None,
+            'feasible_count': None,
+            'feasible_range': [low, high],
+            'reason': 'max_lines_cannot_be_satisfied',
+            'constraint_violations': violations,
+        })
+        return result
+
+    if n_copyrights > 0 and len(bins) < n_copyrights:
+        # Not enough code granularity to form the requested number of
+        # copyrights that each meet min_lines.  Report instead of silently
+        # succeeding with fewer.
+        result = dict(base_result)
+        result.update({
+            'copyrights': [],
+            'status': 'infeasible',
+            'requested_count': n_copyrights,
+            'feasible_count': len(bins),
+            'feasible_range': [low, high],
+            'reason': 'insufficient_eligible_code',
+            'detail': 'module_granularity_too_coarse',
+        })
+        return result
+
     if verbose:
         print(f"Actual copyrights generated: {len(bins)}")
     
@@ -433,13 +579,15 @@ def auto_split(
             print(f"    Files: {len(cr_files)}, Lines: {cr_total_lines}")
             print(f"    Paths: {', '.join(sorted(include_paths)[:5])}")
     
-    return {
+    result = dict(base_result)
+    result.update({
         'copyrights': copyrights,
-        'total_files': len(eligible_files),
-        'total_lines': total_lines,
-        'skipped_used': skipped_used,
-        'skipped_non_team': skipped_non_team,
-    }
+        'status': 'ok',
+        'requested_count': n_copyrights if n_copyrights > 0 else None,
+        'feasible_count': len(copyrights),
+        'feasible_range': [low, high],
+    })
+    return result
 
 
 # ============================================================
@@ -493,6 +641,14 @@ def generate_config_yaml(
 def export_split_report(split_result: Dict, output_path: Path):
     """Export detailed split report as JSON."""
     report = {
+        'status': split_result.get('status', 'ok'),
+        'reason': split_result.get('reason'),
+        'requested_count': split_result.get('requested_count'),
+        'feasible_count': split_result.get('feasible_count'),
+        'feasible_range': split_result.get('feasible_range'),
+        'min_lines': split_result.get('min_lines'),
+        'max_lines': split_result.get('max_lines'),
+        'constraint_violations': split_result.get('constraint_violations', []),
         'total_files': split_result['total_files'],
         'total_lines': split_result['total_lines'],
         'skipped_used': split_result['skipped_used'],
@@ -519,6 +675,36 @@ def export_split_report(split_result: Dict, output_path: Path):
 # ============================================================
 # CLI
 # ============================================================
+
+def _print_failure(result: Dict):
+    """Print an explicit, actionable failure summary (never silent success)."""
+    status = result.get('status', 'error')
+    print(f"\n{'=' * 60}")
+    print(f"Auto-Split FAILED: {status}")
+    print(f"{'=' * 60}")
+    print(f"  Eligible files: {result.get('total_files', 0)}")
+    print(f"  Total lines: {result.get('total_lines', 0)}")
+    if result.get('requested_count'):
+        print(f"  requested_count: {result['requested_count']}")
+    if result.get('feasible_count') is not None:
+        print(f"  feasible_count: {result['feasible_count']}")
+    if result.get('feasible_range'):
+        low, high = result['feasible_range']
+        print(f"  feasible_range: {low}-{high}")
+    if result.get('reason'):
+        print(f"  reason: {result['reason']}")
+    if result.get('detail'):
+        print(f"  detail: {result['detail']}")
+    for violation in result.get('constraint_violations', []):
+        if violation.get('type') == 'oversized_atomic_module':
+            print(f"  constraint_violation: oversized_atomic_module "
+                  f"'{violation['module']}' has {violation['total_lines']} lines "
+                  f"> max_lines {violation['max_lines']} and cannot be split further")
+        else:
+            print(f"  constraint_violation: {violation}")
+    if result.get('error'):
+        print(f"  {result['error']}")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -564,15 +750,17 @@ def main():
         verbose=args.verbose,
     )
     
-    if result.get('error'):
-        print(f"Error: {result['error']}")
-        sys.exit(1)
-    
-    # Generate config
-    yaml_str = generate_config_yaml(result, args.repo_name, args.output_config)
-    
-    # Export report
+    # Always export the report (evidence), even when the split failed.
     export_split_report(result, args.output_report)
+
+    if result.get('status') != 'ok':
+        _print_failure(result)
+        print(f"\n  Report: {args.output_report}")
+        print("  No config was written.")
+        sys.exit(1)
+
+    # Generate config only for a feasible split
+    yaml_str = generate_config_yaml(result, args.repo_name, args.output_config)
     
     # Print summary
     print(f"\n{'=' * 60}")
