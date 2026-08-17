@@ -27,6 +27,11 @@
 - ✅ **严格材料审计**：核验60页、逐页行数、字号、A4、行号、重复内容和主要功能字数
 - ✅ **已提交材料冻结**：用目录摘要阻止已提交材料被重新生成或覆盖
 - ✅ **最终审计**：提交前交叉检查代码分配、工作区和最终 PDF
+- ✅ **权属核验**：基于锁定 Commit 的真实 git blame 统计团队贡献比例，低于阈值的文件默认排除
+- ✅ **已用代码排除**：已提交过的软著代码可登记标记，分配时默认排除并保留证据
+- ✅ **歧义检测**：同一文件命中多个软著规则时明确失败，绝不按 YAML 顺序隐式选择
+- ✅ **判定证据**：每个文件输出资格与分配决策的完整证据链（机器可读 JSON）
+- ✅ **运行清单**：run-manifest 记录产生当前分配所依赖的 Commit、配置与过滤条件
 
 ## 鉴别材料硬性规则
 
@@ -64,7 +69,7 @@ python copyright_cli.py requirements
 ### 1. 安装依赖
 
 ```bash
-cd /opt/WorkStation/copyright-asset-allocator
+cd /path/to/copyright-asset-allocator
 pip install -r requirements.txt
 ```
 
@@ -88,6 +93,7 @@ python copyright_cli.py init
 python copyright_cli.py scan /path/to/your/repo
 ```
 
+扫描会锁定一个 Git Commit，之后所有分配、工作区和审计都基于该 Commit。
 扫描结果保存在：
 - `copyright/inventory/repository-files.csv`
 - `copyright/inventory/scan-result.json`
@@ -124,18 +130,90 @@ copyrights:
       - vendor/**
 ```
 
-### 5. 分配文件
+**规则重叠检查**：不同软著的匹配集合必须互斥。如果同一文件同时匹配两个及以上软著，
+`allocate` 直接失败退出（exit code 1），并生成 `copyright/allocations/ambiguous-files.json`
+列出全部冲突文件；系统绝不会按 YAML 条目顺序隐式选择。请通过调整 `include_paths`
+或使用 `exclude_paths` 显式排除来解决冲突。
+
+### 5. （可选）权属核验
+
+基于锁定 Commit 的真实 `git blame` 记录统计每个文件的团队贡献比例：
+
+```bash
+# 登记团队成员（也可用 ownership load-config team.yaml 批量加载）
+python copyright_cli.py ownership add-member --name 张三 --email zhangsan@example.com
+python copyright_cli.py ownership list-members
+
+# 运行权属分析（可加 --since YYYY-MM-DD 只统计该日期后的代码）
+python copyright_cli.py ownership analyze
+```
+
+分析结果写入数据库 `file_team_stats`。团队贡献比例低于 0.5 的文件在分配时默认排除，
+其判定状态为 `skipped_non_team`，证据保留在判定文件中。
+
+### 6. （可选）标记已使用代码
+
+如果部分代码已经用于其他软著的已提交材料，先登记，避免本次重复使用：
+
+```bash
+# 方式一：从过往提交文档中抽取匹配代码行
+python copyright_cli.py mark-used mark copyright/manuals/old-system.md \
+  --copyright-name 旧系统V1.0
+
+# 方式二：从证据 CSV 导入精确的已用路径清单
+python copyright_cli.py mark-used import used-manifest.csv --copyright-name 旧系统V1.0
+
+# 查看当前已用标记
+python copyright_cli.py mark-used report
+```
+
+被标记文件在分配时默认排除，判定状态为 `skipped_used`。
+
+### 7. （可选）时间过滤
+
+只允许某个日期之后提交的代码参与分配：
+
+```bash
+python copyright_cli.py set-since set 2025-01-01
+python copyright_cli.py set-since show
+python copyright_cli.py set-since clear
+```
+
+### 8. 分配文件
 
 ```bash
 python copyright_cli.py allocate
 ```
 
 分配结果保存在：
-- `copyright/allocations/<copyright-id>-files.txt`
-- `copyright/allocations/<copyright-id>-files.json`
+- `copyright/allocations/<copyright-id>-files.txt` / `.json`
 - `copyright/allocations/allocation-summary.json`
+- `copyright/allocations/allocation-decisions.json` —— 每个文件的资格与分配判定证据
+- `copyright/inventory/run-manifest.json` —— 本次分配依赖的 Commit、配置哈希与过滤条件
 
-### 6. 验证分配
+分配语义：
+- **0 个规则匹配** → 记为 UNALLOCATED，不分配
+- **恰好 1 个规则匹配** → 正常分配
+- **多个规则匹配** → AMBIGUOUS：命令失败退出，输出 `ambiguous-files.json`
+- **已用 / 权属不达标文件** → 默认跳过（`skipped_used` / `skipped_non_team`），证据仍被记录
+
+### 9. （替代方案）自动拆分
+
+不手写 `copyrights.yaml` 时，可以按目录/模块把合格代码自动拆分为多个软著：
+
+```bash
+python copyright_cli.py auto-split --min-lines 3000 --max-lines 8000 --count 4
+```
+
+约束语义是严格的，不会静默降级：
+- `--count N`：如果合格代码不足以组成 N 个都满足最低行数的软著，结果为
+  `status: infeasible`，命令失败并说明原因，不会偷偷减少数量后报告成功。
+- `--max-lines M`：每个拆分结果应满足 `min_lines <= 行数 <= max_lines`；
+  单一不可拆模块超过上限时报告 `constraint_violation: oversized_atomic_module`。
+- 仅当 `status: ok` 时才写出 `copyright/config/copyrights-auto.yaml`；
+  完整报告始终写入 `copyright/inventory/auto-split-report.json`。
+
+### 10. 验证分配
 
 ```bash
 python copyright_cli.py validate
@@ -146,7 +224,7 @@ python copyright_cli.py validate
 - 每个软著是否有足够的代码（默认 3000 行）
 - 是否有未分配的源文件
 
-### 7. 构建工作区
+### 11. 构建工作区
 
 为每个软著构建隔离工作区：
 
@@ -154,6 +232,10 @@ python copyright_cli.py validate
 python copyright_cli.py workspace collector
 python copyright_cli.py workspace parser
 ```
+
+工作区内容从**锁定的 Commit** 读取（`git show`），而不是当前工作区树，避免
+“扫描时 HEAD=A、生成时 HEAD=B”的漂移；每个文件写入前重新校验 SHA-256，拒绝
+`../`、绝对路径和符号链接逃逸，并与 run-manifest 中的 Commit 做一致性检查。
 
 工作区结构：
 ```
@@ -165,7 +247,7 @@ copyright/workspaces/collector/
     └── libs/protocol-receiver/
 ```
 
-### 8. 检测重合
+### 12. 检测重合
 
 ```bash
 python copyright_cli.py detect
@@ -176,7 +258,7 @@ python copyright_cli.py detect
 2. **哈希重复**：不同路径但内容完全相同
 3. **代码相似**：函数级别的代码相似度
 
-### 9. 准备说明书并生成材料
+### 13. 准备说明书并生成材料
 
 每个软著必须准备一份系统专用 Markdown 说明书。推荐保存为
 `copyright/manuals/<copyright-id>.md`，也可以通过 `--manual` 显式指定。说明书写作约束见
@@ -202,7 +284,7 @@ python copyright_cli.py material-audit /path/to/单套软著材料目录 \
   --output copyright/outputs/material-audit.json
 ```
 
-### 10. 最终审计
+### 14. 最终审计
 
 ```bash
 python copyright_cli.py audit
@@ -213,7 +295,7 @@ python copyright_cli.py audit
 - 完整文件重复 = 0
 - 软件名称一致性
 - 版本号一致性
-- Commit 一致性
+- Commit 一致性（扫描、run-manifest、工作区与审计必须一致，不一致直接失败）
 - 工作区完整性
 - 两份最终 PDF 均为 A4、恰好60页
 - 程序每页不少于50行，说明书每页不少于30行
@@ -225,13 +307,18 @@ python copyright_cli.py audit
 
 ```
 copyright-asset-allocator/
-├── copyright_cli.py              # CLI 入口
-├── requirements.txt              # Python 依赖
+├── copyright_cli.py              # CLI 入口（兼容入口，业务逻辑在 scripts/）
+├── pyproject.toml                # 项目元数据与 pytest 配置
+├── requirements.txt              # Python 依赖（安装用权威清单）
 ├── README.md                     # 本文档
+├── docs/
+│   └── architecture-and-invariants.md # 架构、数据流与不变量清单（I1–I10）
+├── .github/workflows/tests.yml   # CI：core 与 materials 测试，Python 3.11/3.12
 │
 ├── copyright/
 │   ├── config/
 │   │   ├── copyrights.yaml       # 软著配置
+│   │   ├── copyrights-auto.yaml  # auto-split 生成的配置（仅 status=ok 时写出）
 │   │   ├── material-requirements.yaml # 通用材料硬性规则
 │   │   ├── material-protected-assets.yaml.example # 冻结配置示例
 │   │   └── material-protected-assets.local.yaml # 本机冻结清单，不进入Git
@@ -240,22 +327,19 @@ copyright-asset-allocator/
 │   │   ├── assets.db             # SQLite 数据库
 │   │   ├── repository-files.csv  # 文件清单
 │   │   ├── scan-result.json      # 扫描结果
+│   │   ├── run-manifest.json     # 本次分配依赖的 Commit/配置/过滤条件
+│   │   ├── auto-split-report.json
 │   │   ├── validation-report.json
 │   │   └── duplicate-report.json
 │   │
 │   ├── allocations/
-│   │   ├── collector-files.txt
-│   │   ├── collector-files.json
-│   │   ├── parser-files.txt
-│   │   ├── parser-files.json
-│   │   └── allocation-summary.json
+│   │   ├── <copyright-id>-files.txt / .json
+│   │   ├── allocation-summary.json
+│   │   ├── allocation-decisions.json  # 每文件判定证据（资格+分配）
+│   │   └── ambiguous-files.json       # 多规则匹配冲突清单（存在即分配失败）
 │   │
 │   ├── workspaces/
-│   │   ├── collector/
-│   │   │   ├── SOURCE_MANIFEST.json
-│   │   │   ├── PROJECT_CONTEXT.md
-│   │   │   └── source/
-│   │   └── parser/
+│   │   └── <copyright-id>/
 │   │       ├── SOURCE_MANIFEST.json
 │   │       ├── PROJECT_CONTEXT.md
 │   │       └── source/
@@ -264,26 +348,28 @@ copyright-asset-allocator/
 │   │   └── <copyright-id>.md     # 人工核实的系统说明书
 │   │
 │   ├── outputs/
-│   │   ├── collector/
-│   │   │   ├── 源代码文档.md
-│   │   │   ├── 源代码文档.pdf
-│   │   │   ├── 软件说明书.md
-│   │   │   ├── 软件说明书.pdf
+│   │   ├── <copyright-id>/
+│   │   │   ├── 源代码文档.md / .pdf
+│   │   │   ├── 软件说明书.md / .pdf
 │   │   │   └── XX系统-源代码清单.json
 │   │   └── final-audit.json
 │   │
 │   └── scripts/
-│       ├── database.py           # 数据库操作
-│       ├── scan_repository.py    # 仓库扫描
-│       ├── allocate_files.py     # 文件分配
+│       ├── database.py           # 数据库操作（UNIQUE(commit_id,file_id) 硬约束）
+│       ├── scan_repository.py    # 仓库扫描与 Commit 锁定
+│       ├── analyze_ownership.py  # git blame 团队权属分析
+│       ├── mark_used_code.py     # 已用代码登记与排除
+│       ├── allocate_files.py     # 文件分配（含歧义检测与判定证据）
+│       ├── auto_split.py         # 自动拆分（min/max/count 严格约束）
 │       ├── validate_allocations.py
-│       ├── build_workspace.py    # 工作区构建
+│       ├── build_workspace.py    # 工作区构建（从锁定 Commit 取内容）
 │       ├── detect_duplicates.py  # 重合检测
+│       ├── run_manifest.py       # 运行清单与 Commit 一致性校验
 │       ├── generate_markdown_pdf.py # Markdown→PDF主生成流程
 │       ├── generate_docx.py      # DOCX兼容辅助与通用分页函数
 │       ├── material_requirements.py # 规则加载与冻结保护
 │       ├── validate_materials.py # PDF/DOCX/Markdown材料审计
-│       └── final_audit.py        # 最终审计
+│       └── final_audit.py        # 最终审计（引用 run-manifest）
 ```
 
 ## 核心设计
@@ -308,6 +394,44 @@ CREATE TABLE allocations (
 ### 隔离工作区
 
 Agent 只能访问 `copyright/workspaces/<copyright-id>/source/` 目录，无法越界读取其他软著的代码。
+工作区写入路径全部经过边界校验（拒绝 `../`、绝对路径与符号链接逃逸）。
+
+### 判定证据（Decision Evidence）
+
+每个文件都会产生机器可读的判定记录（`copyright/allocations/allocation-decisions.json`），
+用于回答“这个文件为什么合格、为什么属于这个软著”：
+
+```json
+{
+  "path": "services/parser/main.py",
+  "commit": "abcdef",
+  "sha256": "...",
+  "eligibility": {
+    "used_before": false,
+    "team_ratio": 0.91,
+    "team_threshold": 0.5,
+    "eligible": true
+  },
+  "allocation": {
+    "matched_rules": ["parser"],
+    "excluded_rules": [],
+    "decision": "parser",
+    "status": "allocated"
+  }
+}
+```
+
+冲突文件的 `decision` 为 `null`、`status` 为 `ambiguous`；被排除文件保留
+`skipped_used` / `skipped_non_team` 状态及对应证据。
+
+### 运行清单与 Commit 一致性
+
+每次 `allocate` 写出 `copyright/inventory/run-manifest.json`，记录工具版本、仓库、
+锁定 Commit、配置与 requirements 的 SHA-256、时间过滤和拆分参数。工作区构建与最终审计
+都会校验 Commit 一致性（扫描 / manifest / 工作区 / 审计），任何不一致直接失败。
+
+完整的数据流、业务不变量（I1–I10）与代码责任位置见
+[`docs/architecture-and-invariants.md`](docs/architecture-and-invariants.md)。
 
 ## 完整工作流
 
@@ -315,31 +439,41 @@ Agent 只能访问 `copyright/workspaces/<copyright-id>/source/` 目录，无法
 # 1. 初始化
 python copyright_cli.py init
 
-# 2. 扫描仓库
+# 2. 扫描仓库（锁定 Commit）
 python copyright_cli.py scan /path/to/repo
 
-# 3. 编辑配置
+# 3. （可选）权属核验
+python copyright_cli.py ownership load-config team.yaml
+python copyright_cli.py ownership analyze
+
+# 4. （可选）标记已用于其他软著的代码
+python copyright_cli.py mark-used import used-manifest.csv --copyright-name 旧系统V1.0
+
+# 5. （可选）设置时间过滤
+python copyright_cli.py set-since set 2025-01-01
+
+# 6. 编辑软著配置（或用 auto-split 生成 copyrights-auto.yaml）
 vim copyright/config/copyrights.yaml
 
-# 4. 分配文件
+# 7. 分配文件（产生判定证据与 run-manifest）
 python copyright_cli.py allocate
 
-# 5. 验证分配
+# 8. 验证分配
 python copyright_cli.py validate
 
-# 6. 构建工作区（每个软著）
+# 9. 构建工作区（每个软著，内容取自锁定 Commit）
 python copyright_cli.py workspace collector
 python copyright_cli.py workspace parser
 
-# 7. 检测重合
+# 10. 检测重合
 python copyright_cli.py detect
 
-# 8. 生成材料（每个软著）
+# 11. 生成材料（每个软著）
 python copyright_cli.py requirements
 python copyright_cli.py generate collector --manual copyright/manuals/collector.md
 python copyright_cli.py generate parser --manual copyright/manuals/parser.md
 
-# 9. 最终审计
+# 12. 最终审计
 python copyright_cli.py audit
 ```
 
@@ -352,6 +486,9 @@ python copyright_cli.py audit
 5. **文件真实性**：所有代码必须来自真实项目，说明书内容必须与系统逻辑一致，禁止编造
 6. **以 PDF 为准**：Markdown 是可追溯源稿，最终是否60页及逐页行数必须检查直接渲染出的 PDF
 7. **冻结材料**：已经提交的材料只允许只读审计；需要更新冻结基线时必须先确认申请状态，不能自行改摘要
+8. **无隐式顺序**：文件匹配多个软著时立即失败，YAML 条目顺序永远不会成为裁决依据
+9. **显式失败**：不可满足的拆分数量或行数约束只会报告 infeasible / constraint_violation，不会静默降级
+10. **Commit 一致性**：扫描、run-manifest、工作区与最终审计的 Commit 必须一致，任何不一致都会导致失败
 
 ## License
 
