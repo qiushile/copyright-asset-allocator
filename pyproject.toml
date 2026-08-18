@@ -9,7 +9,7 @@
 
 [project]
 name = "copyright-asset-allocator"
-version = "1.1.0"
+version = "1.2.0"
 description = "软著代码资产分配系统：扫描、权属核验、唯一分配、重合检测、材料生成与审计"
 readme = "README.md"
 requires-python = ">=3.9"

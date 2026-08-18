@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 # Single source of truth for the tool version (referenced by the manifest).
-TOOL_VERSION = "1.1.0"
+TOOL_VERSION = "1.2.0"
 
 DEFAULT_MANIFEST_PATH = Path('copyright/inventory/run-manifest.json')
 DEFAULT_CONFIG_PATH = Path('copyright/config/copyrights.yaml')
