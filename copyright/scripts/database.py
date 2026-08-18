@@ -518,6 +518,60 @@ def insert_file(commit_id: int, file_path: str, sha256: str, language: str,
         return cursor.fetchone()[0]
 
 
+def insert_files(commit_id: int, rows: list) -> dict:
+    """Batch insert/update file records in ONE connection and ONE transaction.
+
+    ``rows`` items may be dicts with keys ``file_path``, ``sha256``,
+    ``language``, ``total_lines``, ``effective_lines``, ``file_size`` or
+    plain tuples in that order (without commit_id).  Idempotent for
+    re-scans: upsert on (commit_id, file_path), same semantics as
+    ``insert_file``.
+
+    Returns ``{file_path: file_id}``.  The whole batch is atomic: any
+    failing row rolls back every row of the batch, so a commit can never
+    be left half-scanned.
+    """
+    if not rows:
+        return {}
+
+    normalized = []
+    for row in rows:
+        if isinstance(row, dict):
+            normalized.append((
+                commit_id,
+                row['file_path'],
+                row['sha256'],
+                row['language'],
+                row['total_lines'],
+                row['effective_lines'],
+                row['file_size'],
+            ))
+        else:
+            normalized.append((commit_id,) + tuple(row))
+
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.executemany("""
+            INSERT INTO files (commit_id, file_path, sha256, language, total_lines, effective_lines, file_size)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(commit_id, file_path) DO UPDATE SET
+                sha256 = excluded.sha256,
+                language = excluded.language,
+                total_lines = excluded.total_lines,
+                effective_lines = excluded.effective_lines,
+                file_size = excluded.file_size
+        """, normalized)
+
+        paths = [r[1] for r in normalized]
+        placeholders = ','.join('?' * len(paths))
+        cursor.execute(
+            f"SELECT file_path, id FROM files "
+            f"WHERE commit_id = ? AND file_path IN ({placeholders})",
+            (commit_id, *paths),
+        )
+        return {path: file_id for path, file_id in cursor.fetchall()}
+
+
 def allocate_file(commit_id: int, file_id: int, copyright_id: int) -> bool:
     """
     Allocate file to copyright.

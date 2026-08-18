@@ -21,6 +21,7 @@ from database import (
     get_or_create_repository,
     init_database,
     insert_file,
+    insert_files,
 )
 
 
@@ -212,3 +213,97 @@ class TestForeignKeys:
                     "INSERT INTO files (commit_id, file_path, sha256) "
                     "VALUES (999999, 'orphan.py', 'c' * 64)"
                 )
+
+
+def _batch_rows(paths, lines=100, sha="0" * 64):
+    return [
+        {
+            "file_path": path,
+            "sha256": sha,
+            "language": "Python",
+            "total_lines": lines,
+            "effective_lines": lines,
+            "file_size": lines * 20,
+        }
+        for path in paths
+    ]
+
+
+class TestBatchInsertFiles:
+    """Batch scan inserts: one connection, one atomic transaction."""
+
+    def test_batch_insert_returns_path_to_id_mapping(self, db):
+        paths = ["a.py", "b/c.py", "d/e/f.py"]
+        mapping = insert_files(db, _batch_rows(paths))
+        assert set(mapping) == set(paths)
+        assert len(set(mapping.values())) == 3  # distinct ids
+
+    def test_accepts_tuple_rows_like_dict_rows(self, db):
+        mapping = insert_files(
+            db, [("t.py", "1" * 64, "Python", 5, 5, 100)]
+        )
+        assert list(mapping) == ["t.py"]
+
+    def test_batch_rescan_is_idempotent_and_updates_content(self, db):
+        paths = ["a.py", "b.py"]
+        first = insert_files(db, _batch_rows(paths, lines=100))
+        second = insert_files(db, _batch_rows(paths, lines=250, sha="f" * 64))
+        assert first == second  # ids stable across re-scans
+
+        with get_connection() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM files WHERE commit_id = ?", (db,)
+            ).fetchone()[0]
+            row = conn.execute(
+                "SELECT effective_lines, sha256 FROM files "
+                "WHERE commit_id = ? AND file_path = 'a.py'",
+                (db,),
+            ).fetchone()
+        assert count == 2  # no duplicate rows
+        assert row == (250, "f" * 64)  # content refreshed
+
+    def test_batch_is_atomic_when_one_row_is_invalid(self, db):
+        rows = _batch_rows(["good1.py", "good2.py"])
+        # sha256 is NOT NULL: this row must abort the WHOLE batch.
+        bad = _batch_rows(["bad.py"])
+        bad[0]["sha256"] = None
+        rows.insert(1, bad[0])
+
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_files(db, rows)
+
+        with get_connection() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM files WHERE commit_id = ?", (db,)
+            ).fetchone()[0]
+        assert count == 0, "failed batch must roll back every row"
+
+    def test_empty_rows_returns_empty_dict(self, db):
+        assert insert_files(db, []) == {}
+
+
+class TestScanUsesBatchInsert:
+    """End-to-end: a real scan still works through the batch path."""
+
+    def test_scan_populates_ids_via_batch_insert(self, seeded_scan):
+        scan, _ = seeded_scan(
+            {
+                "services/a/one.py": "print(1)\n",
+                "services/a/two.py": "print(2)\n",
+                "services/b/three.py": "print(3)\n",
+            }
+        )
+        ids = [f["id"] for f in scan["files"]]
+        assert len(ids) == 3
+        assert len(set(ids)) == 3  # distinct real ids
+        # Re-scan the same commit: ids must be stable (upsert, no dupes).
+        from scan_repository import scan_repository
+
+        rescan = scan_repository(scan_repo_path(scan), scan["commit_hash"])
+        assert sorted(f["id"] for f in rescan["files"]) == sorted(ids)
+
+
+def scan_repo_path(scan_result):
+    from pathlib import Path as _Path
+
+    return _Path(scan_result["repo_path"])

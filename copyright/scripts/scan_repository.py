@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from database import (
     init_database, get_connection, get_or_create_repository,
-    get_or_create_commit, insert_file
+    get_or_create_commit, insert_files
 )
 
 # 语言扩展名映射
@@ -241,20 +241,8 @@ def scan_repository(
         
         # 获取文件大小
         file_size = len(content)
-        
-        # 插入数据库（幂等：重复扫描会更新而非报错）
-        file_id = insert_file(
-            commit_id=commit_id,
-            file_path=file_path,
-            sha256=sha256,
-            language=language,
-            total_lines=total_lines,
-            effective_lines=effective_lines,
-            file_size=file_size
-        )
-        
+
         files.append({
-            'id': file_id,
             'path': file_path,
             'sha256': sha256,
             'language': language,
@@ -262,10 +250,26 @@ def scan_repository(
             'effective_lines': effective_lines,
             'file_size': file_size,
         })
-        
+
         if verbose and len(files) % 100 == 0:
             print(f"  Scanned {len(files)} files...")
-    
+
+    # 批量写入数据库：单连接、单事务（幂等：重复扫描会更新而非报错）。
+    # 原子性保证 commit 不会被扫描到一半——任何一行失败整体回滚。
+    file_ids = insert_files(commit_id, [
+        (
+            f['path'],
+            f['sha256'],
+            f['language'],
+            f['total_lines'],
+            f['effective_lines'],
+            f['file_size'],
+        )
+        for f in files
+    ])
+    for record in files:
+        record['id'] = file_ids[record['path']]
+
     if verbose:
         print(f"Scanned {len(files)} files, excluded {len(excluded)} files")
     
