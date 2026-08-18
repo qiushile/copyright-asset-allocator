@@ -32,6 +32,9 @@
 - ✅ **歧义检测**：同一文件命中多个软著规则时明确失败，绝不按 YAML 顺序隐式选择
 - ✅ **判定证据**：每个文件输出资格与分配决策的完整证据链（机器可读 JSON）
 - ✅ **运行清单**：run-manifest 记录产生当前分配所依赖的 Commit、配置与过滤条件
+- ✅ **审计事件日志**：append-only 记录 scan/allocate/generate/audit 等关键操作，`events` 命令可回放
+- ✅ **数据库迁移**：schema_version + 有序 migration，旧库可安全升级
+- ✅ **仓库级时间过滤**：since 截止日期可按仓库单独设置，互不泄漏（全局值兜底）
 
 ## 鉴别材料硬性规则
 
@@ -179,6 +182,20 @@ python copyright_cli.py set-since show
 python copyright_cli.py set-since clear
 ```
 
+操作多个仓库时，可以把截止日期限定在单个仓库，避免 A 项目的时间过滤
+影响 B 项目：
+
+```bash
+python copyright_cli.py set-since set 2025-01-01 --repo-path /path/to/repo-a
+python copyright_cli.py set-since show --repo-path /path/to/repo-a
+python copyright_cli.py set-since clear --repo-path /path/to/repo-a
+```
+
+规则：仓库级设置优先于全局设置；清除仓库级设置后回落到全局值；
+`ownership analyze --since` 也按当前扫描的仓库作用域保存。
+团队成员名单（`team_members`）是全局的：它描述的是人员名册而非项目状态，
+资格判定仍然逐 Commit 由 git blame 证据决定（见“核心设计”）。
+
 ### 8. 分配文件
 
 ```bash
@@ -258,6 +275,10 @@ python copyright_cli.py detect
 2. **哈希重复**：不同路径但内容完全相同
 3. **代码相似**：函数级别的代码相似度
 
+相似代码的发现结果带有人工复核所需的定位信息（`duplicate-report.json`）：
+`type`、`file_a`/`file_b`、`function_a`/`function_b`、相似度以及
+1-based 的 `lines_a`/`lines_b` 行号区间，而不只是“相似对数量”。
+
 ### 13. 准备说明书并生成材料
 
 每个软著必须准备一份系统专用 Markdown 说明书。推荐保存为
@@ -324,7 +345,7 @@ copyright-asset-allocator/
 │   │   └── material-protected-assets.local.yaml # 本机冻结清单，不进入Git
 │   │
 │   ├── inventory/
-│   │   ├── assets.db             # SQLite 数据库
+│   │   ├── assets.db             # SQLite 数据库（schema_version + migrations）
 │   │   ├── repository-files.csv  # 文件清单
 │   │   ├── scan-result.json      # 扫描结果
 │   │   ├── run-manifest.json     # 本次分配依赖的 Commit/配置/过滤条件
@@ -355,7 +376,7 @@ copyright-asset-allocator/
 │   │   └── final-audit.json
 │   │
 │   └── scripts/
-│       ├── database.py           # 数据库操作（UNIQUE(commit_id,file_id) 硬约束）
+│       ├── database.py           # 数据库操作（UNIQUE(commit_id,file_id) 硬约束、migrations、审计事件）
 │       ├── scan_repository.py    # 仓库扫描与 Commit 锁定
 │       ├── analyze_ownership.py  # git blame 团队权属分析
 │       ├── mark_used_code.py     # 已用代码登记与排除
@@ -432,6 +453,35 @@ Agent 只能访问 `copyright/workspaces/<copyright-id>/source/` 目录，无法
 
 完整的数据流、业务不变量（I1–I10）与代码责任位置见
 [`docs/architecture-and-invariants.md`](docs/architecture-and-invariants.md)。
+
+### 数据库 Schema 版本化
+
+`assets.db` 内置 `schema_migrations` 表：每次启动时按版本号顺序补齐缺失的
+migration（单事务执行，失败整体回滚）。已发布的 migration 永不改写，新变更
+只能追加新版本号。当前版本：
+
+| 版本 | 内容 |
+| --- | --- |
+| 1 | 基线 schema（repositories/commits/files/allocations/…，含 `UNIQUE(commit_id, file_id)` 硬约束） |
+| 2 | `audit_events` 审计事件表（INSERT-only） |
+| 3 | `repository_settings` 仓库级设置（`UNIQUE(repository_id, key)`） |
+
+### 审计事件日志
+
+每个关键操作（scan、allocate、workspace、detect、generate、audit、mark-used、
+ownership analyze、auto-split、材料审计等）都会向 `audit_events` 追加一条记录：
+时间、仓库、Commit、操作类型、配置 SHA-256、状态与细节。分配被歧义拒绝时记录
+`rejected_ambiguous`。事件只增不改不删（模块不提供 update/delete 入口）：
+
+```bash
+python copyright_cli.py events            # 查看全部事件（按时间正序）
+python copyright_cli.py events --limit 20 --operation ALLOCATION_APPLIED
+```
+
+### 扫描性能
+
+同一 Commit 的文件清单以单连接、单事务批量写入（`executemany` upsert），
+重复扫描保持幂等；任何坏行都会整体回滚，不会留下半批数据。
 
 ## 完整工作流
 

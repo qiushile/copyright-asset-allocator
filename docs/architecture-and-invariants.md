@@ -9,7 +9,7 @@
 | Python | 3.9.20（pyenv；运行时依赖已全局安装，含 weasyprint 66.0） |
 | 测试框架 | pytest 8.4.2（项目本地 `.venv`，system-site-packages） |
 | 基线测试 | `pytest tests/` → **17 passed**（全部集中在材料/PDF/冻结/历史扫描） |
-| CLI 命令 | init, scan, allocate, validate, workspace, detect, generate, audit, requirements, material-audit, mark-used(mark/import/report/clear), ownership(add-member/remove-member/list-members/load-config/analyze), set-since(set/show/clear), auto-split |
+| CLI 命令 | init, scan, allocate, validate, workspace, detect, generate, audit, requirements, material-audit, mark-used(mark/import/report/clear), ownership(add-member/remove-member/list-members/load-config/analyze), set-since(set/show/clear，均支持 --repo-path), auto-split, events |
 | 核心引擎测试 | **无**（database / allocate / auto-split 约束 / validate / detect / ownership 均无单元测试） |
 
 ## 2. 数据流
@@ -36,7 +36,7 @@ code_ownership, file_team_stats, project_settings。
 - `allocations.UNIQUE(commit_id, file_id)` —— 同一 Commit 下同一文件只能分配给一个软著。
 - `files.UNIQUE(commit_id, file_path)`、`commits.UNIQUE(repository_id, commit_hash)`。
 - `used_files.UNIQUE(commit_id, file_id, copyright_name)`。
-- 无 `schema_version`（P1：需要迁移机制）。
+- `schema_migrations` + `SCHEMA_VERSION`（migration 1 基线 / 2 audit_events / 3 repository_settings），init_database 单事务补齐缺失版本（基线报告时无此机制，Run 2 已实现，见 §7）。
 
 ## 4. 业务不变量 → 责任代码位置
 
@@ -79,3 +79,28 @@ code_ownership, file_team_stats, project_settings。
   decision evidence、run-manifest、commit 一致性、workspace 从锁定 commit 读取 + 路径逃逸防护。
 - 材料规则链路（I8/I9/I10）不改动，仅保护。
 - 不引入 priority 机制（显式配置留待后续迭代）；本轮只消灭隐式顺序依赖。
+
+
+## 7. 状态更新（Run 1 / Run 2 之后）
+
+§5 的 Findings 解决情况（未列出的保持原状）：
+
+- **[P0] allocate 隐式顺序依赖** → 已修（Run 1 `3dac378`/`2ed9cb6`）：>1 规则匹配 → `ambiguous`，
+  exit 1 + `ambiguous-files.json`；YAML 顺序永不参与裁决。priority 机制仍未引入（显式决策）。
+- **[P0] auto-split 约束失效** → 已修（Run 1 `9f54ac4`）：`status: ok|infeasible|constraint_violation`，
+  `max_lines` 真实生效，`oversized_atomic_module` 报告，config 仅在 ok 时写出。
+- **[P0] 核心引擎无测试** → 已补（Run 1 `3dac378`/`fb772e7` + Run 2）：DB 不变量、分配、
+  真实 git 仓库 ownership、去重、迁移回滚、审计事件、仓库级设置隔离。
+- **[P1] decision evidence** → 已实现（Run 1 `72fbbb9`）：`allocation-decisions.json`。
+- **[P1] run manifest** → 已实现（Run 1 `8c42783`）：`run-manifest.json` + commit 一致性硬校验。
+- **[P1] build_workspace 从 worktree 复制** → 已改（Run 1 `8c42783`）：内容取自锁定 commit（git show）
+  + sha256 复验 + 路径/符号链接逃逸防护。
+- **[P1] 无 schema_version** → 已实现（Run 2 `87c009f`）。`since_date` 已仓库级隔离
+  （Run 2 `749aa8f`，migration 3；`team_members` 保持全局——人员名册与项目状态分离，
+  资格仍逐 Commit 由 git blame 证据判定，见 database.py team_members 注释与
+  tests/test_repository_settings.py 的锁定测试）。
+- **[P1] detect_duplicates 仅输出计数** → 已实现（Run 2 `be153cd`）：相似函数发现携带
+  `file_a/file_b`、`function_a/function_b`、`lines_a/lines_b`（1-based 闭区间）。
+
+仍未完成（后续迭代候选）：src/ 包化与 sys.path 清理、CLI/业务分层、类型化模型 + 配置结构校验、
+git blame 缓存、业务边界 auto-split 评分、plan/apply 模式、ruff/mypy。
