@@ -32,217 +32,314 @@ def get_connection():
         conn.close()
 
 
-def init_database():
-    """Initialize database schema."""
+# ---------------------------------------------------------------------------
+# Schema versioning & migrations
+# ---------------------------------------------------------------------------
+#
+# Every schema change ships as a numbered, ordered migration in MIGRATIONS.
+# init_database() applies pending migrations inside ONE transaction, so a
+# failed migration rolls back completely and never leaves a half-upgraded
+# evidence database.  Already-applied versions are recorded in
+# ``schema_migrations`` and never re-run.
+#
+# Legacy databases created before versioning (plain CREATE TABLE IF NOT
+# EXISTS) are adopted non-destructively: migration 0001 uses idempotent DDL,
+# so existing rows survive and the DB is stamped at version 1.
+
+MIGRATION_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+"""
+
+
+def _migration_0001_baseline_schema(cursor):
+    """Baseline schema: all core tables and indexes (idempotent DDL)."""
+
+    # 仓库表
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS repositories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            path TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Commit 表
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS commits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            repository_id INTEGER NOT NULL,
+            commit_hash TEXT NOT NULL,
+            tag TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (repository_id) REFERENCES repositories(id),
+            UNIQUE(repository_id, commit_hash)
+        )
+    """)
+
+    # 文件表
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            commit_id INTEGER NOT NULL,
+            file_path TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            language TEXT,
+            total_lines INTEGER,
+            effective_lines INTEGER,
+            file_size INTEGER,
+            FOREIGN KEY (commit_id) REFERENCES commits(id),
+            UNIQUE(commit_id, file_path)
+        )
+    """)
+
+    # 软著表
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS copyrights (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            commit_id INTEGER NOT NULL,
+            copyright_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            version TEXT NOT NULL,
+            description TEXT,
+            status TEXT DEFAULT 'draft',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            locked_at TIMESTAMP,
+            FOREIGN KEY (commit_id) REFERENCES commits(id),
+            UNIQUE(commit_id, copyright_id)
+        )
+    """)
+
+    # 分配表 - 核心：唯一约束防止重复分配
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS allocations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            commit_id INTEGER NOT NULL,
+            file_id INTEGER NOT NULL,
+            copyright_id INTEGER NOT NULL,
+            allocated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (commit_id) REFERENCES commits(id),
+            FOREIGN KEY (file_id) REFERENCES files(id),
+            FOREIGN KEY (copyright_id) REFERENCES copyrights(id),
+            UNIQUE(commit_id, file_id)
+        )
+    """)
+
+    # 排除文件表
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS excluded_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            commit_id INTEGER NOT NULL,
+            file_id INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            FOREIGN KEY (commit_id) REFERENCES commits(id),
+            FOREIGN KEY (file_id) REFERENCES files(id),
+            UNIQUE(commit_id, file_id)
+        )
+    """)
+
+    # 重合检测报告表
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS duplicate_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            commit_id INTEGER NOT NULL,
+            copyright_id_1 INTEGER NOT NULL,
+            copyright_id_2 INTEGER NOT NULL,
+            path_overlap_count INTEGER DEFAULT 0,
+            exact_file_overlap_count INTEGER DEFAULT 0,
+            similar_function_count INTEGER DEFAULT 0,
+            similar_block_count INTEGER DEFAULT 0,
+            max_similar_block_lines INTEGER DEFAULT 0,
+            overall_similarity_ratio REAL DEFAULT 0.0,
+            report_json TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (commit_id) REFERENCES commits(id),
+            FOREIGN KEY (copyright_id_1) REFERENCES copyrights(id),
+            FOREIGN KEY (copyright_id_2) REFERENCES copyrights(id)
+        )
+    """)
+
+    # ========== 新增表 ==========
+
+    # 已申请软著代码标记表（功能1）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS used_code_markers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            commit_id INTEGER NOT NULL,
+            file_id INTEGER NOT NULL,
+            copyright_name TEXT NOT NULL,
+            source_document TEXT,
+            line_start INTEGER,
+            line_end INTEGER,
+            code_hash TEXT,
+            marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (commit_id) REFERENCES commits(id),
+            FOREIGN KEY (file_id) REFERENCES files(id)
+        )
+    """)
+
+    # 已使用文件表（文件级别标记）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS used_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            commit_id INTEGER NOT NULL,
+            file_id INTEGER NOT NULL,
+            copyright_name TEXT NOT NULL,
+            source_document TEXT,
+            match_type TEXT DEFAULT 'exact',
+            marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (commit_id) REFERENCES commits(id),
+            FOREIGN KEY (file_id) REFERENCES files(id),
+            UNIQUE(commit_id, file_id, copyright_name)
+        )
+    """)
+
+    # 团队人员表（功能2）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS team_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL UNIQUE,
+            role TEXT DEFAULT 'developer',
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # 代码归属表（功能2：基于 git blame 的行级归属）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS code_ownership (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            commit_id INTEGER NOT NULL,
+            file_id INTEGER NOT NULL,
+            line_start INTEGER NOT NULL,
+            line_end INTEGER NOT NULL,
+            author_email TEXT NOT NULL,
+            author_name TEXT,
+            is_team_member INTEGER DEFAULT 0,
+            commit_hash TEXT,
+            FOREIGN KEY (commit_id) REFERENCES commits(id),
+            FOREIGN KEY (file_id) REFERENCES files(id)
+        )
+    """)
+
+    # 文件团队代码统计表
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS file_team_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            commit_id INTEGER NOT NULL,
+            file_id INTEGER NOT NULL,
+            total_lines INTEGER DEFAULT 0,
+            team_lines INTEGER DEFAULT 0,
+            team_ratio REAL DEFAULT 0.0,
+            is_eligible INTEGER DEFAULT 0,
+            FOREIGN KEY (commit_id) REFERENCES commits(id),
+            FOREIGN KEY (file_id) REFERENCES files(id),
+            UNIQUE(commit_id, file_id)
+        )
+    """)
+
+    # 项目设置表（全局设置；仓库级设置见 repository_settings，migration 0004）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS project_settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key TEXT NOT NULL UNIQUE,
+            value TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # 索引
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_files_commit ON files(commit_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_files_path ON files(file_path)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_allocations_commit ON allocations(commit_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_allocations_file ON allocations(file_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_allocations_copyright ON allocations(copyright_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_used_files_commit ON used_files(commit_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_used_files_file ON used_files(file_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_code_ownership_commit ON code_ownership(commit_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_code_ownership_file ON code_ownership(file_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_code_ownership_email ON code_ownership(author_email)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_team_stats_commit ON file_team_stats(commit_id)")
+
+
+#: Ordered list of (version, name, apply_fn).  Versions must be strictly
+#: increasing and gaps are forbidden; add new migrations at the end, never
+#: edit an already-released one.
+MIGRATIONS = [
+    (1, 'baseline_schema', _migration_0001_baseline_schema),
+]
+
+#: Highest schema version the current tool knows about.
+SCHEMA_VERSION = MIGRATIONS[-1][0]
+
+
+def _validate_migrations(migrations):
+    versions = [v for v, _, _ in migrations]
+    if versions != sorted(set(versions)):
+        raise ValueError("MIGRATIONS must have unique, strictly increasing versions")
+
+
+def init_database(migrations=None):
+    """Initialize/upgrade the database schema by applying pending migrations.
+
+    Idempotent: safe to call before every operation.  All pending migrations
+    run inside a single transaction (get_connection commits on success and
+    rolls back on any error), so the schema is never half-upgraded.
+    """
+    migrations = migrations if migrations is not None else MIGRATIONS
+    _validate_migrations(migrations)
     with get_connection() as conn:
         cursor = conn.cursor()
-        
-        # 仓库表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS repositories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                path TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        cursor.execute(MIGRATION_TABLE_SQL)
+        applied = {row[0] for row in
+                   cursor.execute("SELECT version FROM schema_migrations")}
+        pending = [m for m in migrations if m[0] not in applied]
+        if not pending:
+            return
+        # Explicit transaction: Python sqlite3 does not wrap DDL in an
+        # implicit transaction, so without BEGIN a failed migration would
+        # leave partially-created tables behind.  get_connection() commits
+        # on success and rolls back on any error.
+        conn.execute("BEGIN")
+        for version, name, apply_fn in pending:
+            apply_fn(cursor)
+            cursor.execute(
+                "INSERT INTO schema_migrations (version, name) VALUES (?, ?)",
+                (version, name),
             )
-        """)
-        
-        # Commit 表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS commits (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                repository_id INTEGER NOT NULL,
-                commit_hash TEXT NOT NULL,
-                tag TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (repository_id) REFERENCES repositories(id),
-                UNIQUE(repository_id, commit_hash)
-            )
-        """)
-        
-        # 文件表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                commit_id INTEGER NOT NULL,
-                file_path TEXT NOT NULL,
-                sha256 TEXT NOT NULL,
-                language TEXT,
-                total_lines INTEGER,
-                effective_lines INTEGER,
-                file_size INTEGER,
-                FOREIGN KEY (commit_id) REFERENCES commits(id),
-                UNIQUE(commit_id, file_path)
-            )
-        """)
-        
-        # 软著表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS copyrights (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                commit_id INTEGER NOT NULL,
-                copyright_id TEXT NOT NULL,
-                name TEXT NOT NULL,
-                version TEXT NOT NULL,
-                description TEXT,
-                status TEXT DEFAULT 'draft',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                locked_at TIMESTAMP,
-                FOREIGN KEY (commit_id) REFERENCES commits(id),
-                UNIQUE(commit_id, copyright_id)
-            )
-        """)
-        
-        # 分配表 - 核心：唯一约束防止重复分配
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS allocations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                commit_id INTEGER NOT NULL,
-                file_id INTEGER NOT NULL,
-                copyright_id INTEGER NOT NULL,
-                allocated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (commit_id) REFERENCES commits(id),
-                FOREIGN KEY (file_id) REFERENCES files(id),
-                FOREIGN KEY (copyright_id) REFERENCES copyrights(id),
-                UNIQUE(commit_id, file_id)
-            )
-        """)
-        
-        # 排除文件表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS excluded_files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                commit_id INTEGER NOT NULL,
-                file_id INTEGER NOT NULL,
-                reason TEXT NOT NULL,
-                FOREIGN KEY (commit_id) REFERENCES commits(id),
-                FOREIGN KEY (file_id) REFERENCES files(id),
-                UNIQUE(commit_id, file_id)
-            )
-        """)
-        
-        # 重合检测报告表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS duplicate_reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                commit_id INTEGER NOT NULL,
-                copyright_id_1 INTEGER NOT NULL,
-                copyright_id_2 INTEGER NOT NULL,
-                path_overlap_count INTEGER DEFAULT 0,
-                exact_file_overlap_count INTEGER DEFAULT 0,
-                similar_function_count INTEGER DEFAULT 0,
-                similar_block_count INTEGER DEFAULT 0,
-                max_similar_block_lines INTEGER DEFAULT 0,
-                overall_similarity_ratio REAL DEFAULT 0.0,
-                report_json TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (commit_id) REFERENCES commits(id),
-                FOREIGN KEY (copyright_id_1) REFERENCES copyrights(id),
-                FOREIGN KEY (copyright_id_2) REFERENCES copyrights(id)
-            )
-        """)
-        
-        # ========== 新增表 ==========
-        
-        # 已申请软著代码标记表（功能1）
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS used_code_markers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                commit_id INTEGER NOT NULL,
-                file_id INTEGER NOT NULL,
-                copyright_name TEXT NOT NULL,
-                source_document TEXT,
-                line_start INTEGER,
-                line_end INTEGER,
-                code_hash TEXT,
-                marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (commit_id) REFERENCES commits(id),
-                FOREIGN KEY (file_id) REFERENCES files(id)
-            )
-        """)
-        
-        # 已使用文件表（文件级别标记）
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS used_files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                commit_id INTEGER NOT NULL,
-                file_id INTEGER NOT NULL,
-                copyright_name TEXT NOT NULL,
-                source_document TEXT,
-                match_type TEXT DEFAULT 'exact',
-                marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (commit_id) REFERENCES commits(id),
-                FOREIGN KEY (file_id) REFERENCES files(id),
-                UNIQUE(commit_id, file_id, copyright_name)
-            )
-        """)
-        
-        # 团队人员表（功能2）
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS team_members (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                email TEXT NOT NULL UNIQUE,
-                role TEXT DEFAULT 'developer',
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # 代码归属表（功能2：基于 git blame 的行级归属）
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS code_ownership (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                commit_id INTEGER NOT NULL,
-                file_id INTEGER NOT NULL,
-                line_start INTEGER NOT NULL,
-                line_end INTEGER NOT NULL,
-                author_email TEXT NOT NULL,
-                author_name TEXT,
-                is_team_member INTEGER DEFAULT 0,
-                commit_hash TEXT,
-                FOREIGN KEY (commit_id) REFERENCES commits(id),
-                FOREIGN KEY (file_id) REFERENCES files(id)
-            )
-        """)
-        
-        # 文件团队代码统计表
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS file_team_stats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                commit_id INTEGER NOT NULL,
-                file_id INTEGER NOT NULL,
-                total_lines INTEGER DEFAULT 0,
-                team_lines INTEGER DEFAULT 0,
-                team_ratio REAL DEFAULT 0.0,
-                is_eligible INTEGER DEFAULT 0,
-                FOREIGN KEY (commit_id) REFERENCES commits(id),
-                FOREIGN KEY (file_id) REFERENCES files(id),
-                UNIQUE(commit_id, file_id)
-            )
-        """)
-        
-        # 项目设置表（存储时间过滤等全局配置）
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS project_settings (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                key TEXT NOT NULL UNIQUE,
-                value TEXT,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # 索引
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_files_commit ON files(commit_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_files_path ON files(file_path)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_allocations_commit ON allocations(commit_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_allocations_file ON allocations(file_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_allocations_copyright ON allocations(copyright_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_used_files_commit ON used_files(commit_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_used_files_file ON used_files(file_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_code_ownership_commit ON code_ownership(commit_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_code_ownership_file ON code_ownership(file_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_code_ownership_email ON code_ownership(author_email)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_team_stats_commit ON file_team_stats(commit_id)")
+
+
+def get_schema_version() -> int:
+    """Return the highest applied migration version (0 = uninitialized)."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+        )
+        if cursor.fetchone() is None:
+            return 0
+        cursor.execute("SELECT MAX(version) FROM schema_migrations")
+        row = cursor.fetchone()
+        return row[0] or 0
+
+
+def get_applied_migrations() -> list:
+    """Return applied migrations as [(version, name, applied_at), ...]."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+        )
+        if cursor.fetchone() is None:
+            return []
+        cursor.execute(
+            "SELECT version, name, applied_at FROM schema_migrations ORDER BY version"
+        )
+        return cursor.fetchall()
 
 
 def get_or_create_repository(name: str, path: str) -> int:
