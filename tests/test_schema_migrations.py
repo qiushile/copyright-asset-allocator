@@ -83,13 +83,14 @@ def test_pending_migrations_apply_in_order_exactly_once(tmp_cwd):
             "CREATE TABLE IF NOT EXISTS migration_probe (id INTEGER PRIMARY KEY)"
         )
 
-    extended = list(MIGRATIONS) + [(2, "probe", migration_two)]
+    probe_version = SCHEMA_VERSION + 1
+    extended = list(MIGRATIONS) + [(probe_version, "probe", migration_two)]
 
     init_database(migrations=extended)
     assert calls == [2]
-    assert get_schema_version() == 2
+    assert get_schema_version() == probe_version
 
-    # Re-init with the same registry must not re-apply migration 2.
+    # Re-init with the same registry must not re-apply the probe migration.
     init_database(migrations=extended)
     assert calls == [2]
     with get_connection() as conn:
@@ -117,12 +118,13 @@ def test_failed_migration_rolls_back_completely(tmp_cwd):
         cursor.execute("CREATE TABLE probe_partial (id INTEGER PRIMARY KEY)")
         raise RuntimeError("simulated migration failure")
 
-    extended = list(MIGRATIONS) + [(2, "broken", broken)]
+    extended = list(MIGRATIONS) + [(SCHEMA_VERSION + 1, "broken", broken)]
     with pytest.raises(RuntimeError):
         init_database(migrations=extended)
 
-    # Neither the partial table nor the version stamp may survive.
-    assert get_schema_version() == 1
+    # Neither the partial table nor the version stamp may survive; the
+    # database stays at the last successfully applied real migration.
+    assert get_schema_version() == SCHEMA_VERSION
     with get_connection() as conn:
         table = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='probe_partial'"

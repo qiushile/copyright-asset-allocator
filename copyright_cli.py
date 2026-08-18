@@ -10,6 +10,41 @@ SCRIPTS_DIR = Path(__file__).parent / 'copyright' / 'scripts'
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 
+def _sha256_file(path: Path) -> str:
+    """SHA-256 of a file's bytes (used to pin configs into audit events)."""
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _audit_event(operation, repository=None, commit_hash=None,
+                 config_sha256=None, status='ok', details=None):
+    """Append one audit event (best effort, append-only).
+
+    The event trail is evidence, not control flow: a failed INSERT must
+    never break the pipeline, but it must be surfaced loudly so a broken
+    evidence trail is never silent.
+    """
+    try:
+        from database import record_audit_event
+
+        record_audit_event(
+            operation,
+            repository=repository,
+            commit_hash=commit_hash,
+            config_sha256=config_sha256,
+            status=status,
+            details=details,
+        )
+    except Exception as exc:
+        print(f"Warning: failed to record audit event {operation}: {exc}",
+              file=sys.stderr)
+
+
 def cmd_init(args):
     """Initialize database and directory structure."""
     from database import init_database
@@ -68,6 +103,16 @@ def cmd_scan(args):
     print(f"  Files: {len(result['files'])}")
     print(f"  Excluded: {len(result['excluded'])}")
 
+    _audit_event(
+        'SCAN_COMPLETED',
+        repository=str(repo_path),
+        commit_hash=result['commit_hash'],
+        details={
+            'files': len(result['files']),
+            'excluded': len(result['excluded']),
+        },
+    )
+
 
 def cmd_allocate(args):
     """Allocate files to copyrights."""
@@ -115,6 +160,7 @@ def cmd_allocate(args):
     # Run manifest: record commit + config + rules + filters for reproducibility.
     # Only written when the run did not hit ambiguity (ambiguous runs allocate
     # nothing and must not leave a manifest that later audits could reference).
+    manifest_config_sha = None
     if not results.get('ambiguous'):
         from run_manifest import write_run_manifest, DEFAULT_CONFIG_PATH, DEFAULT_REQUIREMENTS_PATH
         from database import get_since_date
@@ -130,6 +176,7 @@ def cmd_allocate(args):
             },
             since=get_since_date(),
         )
+        manifest_config_sha = manifest['config']['sha256']
         if args.verbose:
             print(f"  Run manifest: copyright/inventory/run-manifest.json "
                   f"(config sha256={manifest['config']['sha256'][:12]}...)")
@@ -166,7 +213,33 @@ def cmd_allocate(args):
         print("  Ambiguous files were NOT allocated (YAML ordering is never a tie-breaker).")
         print("  Narrow include_paths/exclude_paths so each file matches exactly one copyright.")
         print("  See: copyright/allocations/ambiguous-files.json")
+        _audit_event(
+            'ALLOCATION_APPLIED',
+            repository=scan_result.get('repo_path'),
+            commit_hash=scan_result.get('commit_hash'),
+            config_sha256=_sha256_file(config_path),
+            status='rejected_ambiguous',
+            details={'ambiguous_files': len(results['ambiguous'])},
+        )
         sys.exit(1)
+
+    _audit_event(
+        'ALLOCATION_APPLIED',
+        repository=scan_result.get('repo_path'),
+        commit_hash=scan_result.get('commit_hash'),
+        config_sha256=manifest_config_sha or _sha256_file(config_path),
+        status='ok',
+        details={
+            'copyrights': {
+                cr_id: len(files)
+                for cr_id, files in results['allocations'].items()
+            },
+            'unallocated': len(results['unallocated']),
+            'skipped_used': len(results.get('skipped_used') or []),
+            'skipped_non_team': len(results.get('skipped_non_team') or []),
+            'force': bool(args.force),
+        },
+    )
 
 
 def cmd_validate(args):
@@ -228,6 +301,18 @@ def cmd_workspace(args):
     print(f"  Files: {result['total_files']}")
     print(f"  Lines: {result['total_effective_lines']}")
 
+    _audit_event(
+        'WORKSPACE_BUILT',
+        repository=scan_result.get('repo_path'),
+        commit_hash=scan_result.get('commit_hash'),
+        status=result['status'],
+        details={
+            'copyright_id': args.copyright_id,
+            'files': result['total_files'],
+            'effective_lines': result['total_effective_lines'],
+        },
+    )
+
 
 def cmd_detect(args):
     """Detect code duplication."""
@@ -250,11 +335,23 @@ def cmd_detect(args):
     print(f"  Path overlaps: {report['summary']['total_path_overlaps']}")
     print(f"  Exact file overlaps: {report['summary']['total_exact_overlaps']}")
     print(f"  Similar code pairs: {report['summary']['total_similar_pairs']}")
-    
+
     if report['summary']['total_path_overlaps'] > 0 or report['summary']['total_exact_overlaps'] > 0:
+        detect_status = 'critical'
         print("\n  CRITICAL: Path or exact file overlaps detected!")
     elif report['summary']['total_similar_pairs'] > 0:
+        detect_status = 'warning'
         print("\n  WARNING: Similar code blocks detected, manual review recommended")
+    else:
+        detect_status = 'ok'
+
+    _audit_event(
+        'DUPLICATE_DETECTED',
+        repository=scan_result.get('repo_path'),
+        commit_hash=scan_result.get('commit_hash'),
+        status=detect_status,
+        details=report['summary'],
+    )
 
 
 def cmd_generate(args):
@@ -325,6 +422,19 @@ def cmd_generate(args):
     
     print(f"\nAll materials generated in: {output_dir}")
 
+    _audit_event(
+        'MATERIAL_GENERATED',
+        repository=manifest.get('repositoryName'),
+        commit_hash=manifest.get('repositoryCommit'),
+        status='ok',
+        details={
+            'copyright_id': args.copyright_id,
+            'software_name': software_name,
+            'version': version,
+            'code_only': bool(getattr(args, 'code_only', False)),
+        },
+    )
+
 
 def cmd_audit(args):
     """Final audit."""
@@ -350,7 +460,18 @@ def cmd_audit(args):
     print(f"\nFinal Audit: {'PASSED' if results['passed'] else 'FAILED'}")
     print(f"  Errors: {len(results['errors'])}")
     print(f"  Warnings: {len(results['warnings'])}")
-    
+
+    _audit_event(
+        'FINAL_AUDIT',
+        repository=scan_result.get('repo_path'),
+        commit_hash=scan_result.get('commit_hash'),
+        status='passed' if results['passed'] else 'failed',
+        details={
+            'errors': len(results['errors']),
+            'warnings': len(results['warnings']),
+        },
+    )
+
     if not results['passed']:
         for err in results['errors']:
             print(f"  X {err}")
@@ -374,6 +495,14 @@ def cmd_requirements(args):
         'protected_assets': protected,
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))
+    _audit_event(
+        'PROTECTED_ASSETS_AUDITED',
+        status='passed' if report['passed'] else 'failed',
+        details={
+            'config': str(requirements['_config_path']),
+            'assets_checked': len(protected.get('assets', [])),
+        },
+    )
     if not report['passed']:
         sys.exit(1)
 
@@ -391,6 +520,11 @@ def cmd_material_audit(args):
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
     print(json.dumps(report, ensure_ascii=False, indent=2))
+    _audit_event(
+        'MATERIAL_AUDITED',
+        status='passed' if report['passed'] else 'failed',
+        details={'directory': str(Path(args.directory))},
+    )
     if not report['passed']:
         sys.exit(1)
 
@@ -441,6 +575,17 @@ def cmd_mark_used(args):
             print(f"\n  Marked as used:")
             for f in result['marked_files']:
                 print(f"    - {f['file_path']} (ratio: {f['match_ratio']:.1%})")
+
+        _audit_event(
+            'USED_CODE_MARKED',
+            repository=scan_result.get('repo_path'),
+            commit_hash=scan_result.get('commit_hash'),
+            details={
+                'copyright_name': args.copyright_name,
+                'document': str(doc_path),
+                'marked_files': len(result['marked_files']),
+            },
+        )
     
     elif args.action == 'import':
         manifest_path = Path(args.manifest)
@@ -466,6 +611,18 @@ def cmd_mark_used(args):
             for file_path in result['unmatched_paths']:
                 print(f"    - {file_path}")
 
+        _audit_event(
+            'USED_CODE_IMPORTED',
+            repository=scan_result.get('repo_path'),
+            commit_hash=scan_result.get('commit_hash'),
+            details={
+                'copyright_name': args.copyright_name,
+                'manifest': str(manifest_path),
+                'marked_files': len(result['marked_files']),
+                'unmatched_paths': len(result['unmatched_paths']),
+            },
+        )
+
     elif args.action == 'report':
         report = get_used_files_report(scan_result['commit_id'])
         print(f"\nUsed files report:")
@@ -484,6 +641,12 @@ def cmd_mark_used(args):
             cursor.execute("DELETE FROM used_code_markers WHERE commit_id = ?",
                          (scan_result['commit_id'],))
         print("Cleared all used-code markers.")
+
+        _audit_event(
+            'USED_CODE_CLEARED',
+            repository=scan_result.get('repo_path'),
+            commit_hash=scan_result.get('commit_hash'),
+        )
 
 
 # ============================================================
@@ -579,6 +742,17 @@ def cmd_ownership(args):
             for a in report['authors'][:10]:
                 print(f"    {a['name']} <{a['email']}>: {a['total_lines']} lines, {a['file_count']} files")
 
+        _audit_event(
+            'OWNERSHIP_ANALYZED',
+            repository=str(repo_path),
+            commit_hash=scan_result.get('commit_hash'),
+            details={
+                'total_files': report['total_files'],
+                'eligible_files': report['eligible_files'],
+                'ineligible_files': report['ineligible_files'],
+            },
+        )
+
 
 
 # ============================================================
@@ -654,6 +828,20 @@ def cmd_auto_split(args):
     output_report = Path(args.output_report)
     export_split_report(result, output_report)
 
+    _audit_event(
+        'SPLIT_PLANNED',
+        repository=scan_result.get('repo_path'),
+        commit_hash=scan_result.get('commit_hash'),
+        status=result.get('status', 'unknown'),
+        details={
+            'min_lines': args.min_lines,
+            'max_lines': args.max_lines,
+            'requested_count': args.count,
+            'feasible_count': result.get('feasible_count'),
+            'copyrights': len(result.get('copyrights') or []),
+        },
+    )
+
     if result.get('status') != 'ok':
         from auto_split import _print_failure
         _print_failure(result)
@@ -687,6 +875,29 @@ def cmd_auto_split(args):
 
 
 # ============================================================
+# Audit Event Trail
+# ============================================================
+
+def cmd_events(args):
+    """Show the append-only audit event trail (oldest first)."""
+    from database import init_database, list_audit_events
+
+    init_database()
+    events = list_audit_events(limit=args.limit, operation=args.operation)
+    if not events:
+        print("No audit events recorded yet.")
+        return
+
+    print(f"\nAudit events ({len(events)}, oldest first):")
+    for event in reversed(events):
+        commit = (event['commit_hash'] or '-')[:12]
+        repo = event['repository'] or '-'
+        print(f"  [{event['id']:>4}] {event['created_at']}  "
+              f"{event['operation']:<24} status={event['status']:<20} "
+              f"commit={commit}  repo={repo}")
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -709,6 +920,7 @@ Commands:
   ownership   [Feature 2] Analyze code ownership (git blame)
   set-since   [Feature 4] Set time cutoff for code eligibility
   auto-split  [Feature 3] Auto-split code into multiple copyrights
+  events      Show the append-only audit event trail
 
 Example workflow:
   python copyright_cli.py init
@@ -905,8 +1117,16 @@ Example workflow:
                                    help='Output report JSON path')
     auto_split_parser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')
     
+    # events
+    events_parser = subparsers.add_parser('events',
+        help='Show the append-only audit event trail')
+    events_parser.add_argument('--limit', type=int, default=50,
+                               help='Maximum events to show (default: 50)')
+    events_parser.add_argument('--operation',
+                               help='Filter by operation (e.g. ALLOCATION_APPLIED)')
+
     args = parser.parse_args()
-    
+
     if not args.command:
         parser.print_help()
         sys.exit(1)
@@ -929,6 +1149,7 @@ Example workflow:
         'ownership': cmd_ownership,
         'set-since': cmd_set_since,
         'auto-split': cmd_auto_split,
+        'events': cmd_events,
     }
     
     if args.command in ('mark-used', 'ownership', 'set-since') and not getattr(args, 'action', None):

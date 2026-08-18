@@ -266,11 +266,40 @@ def _migration_0001_baseline_schema(cursor):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_file_team_stats_commit ON file_team_stats(commit_id)")
 
 
+def _migration_0002_audit_events(cursor):
+    """Append-only audit event log.
+
+    Every significant operation records WHO ran WHAT against WHICH
+    commit/config, so the evidence trail can be replayed without parsing
+    shell history.  Rows are INSERT-only by design: the module exposes no
+    update/delete helper for this table.
+    """
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS audit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            operation TEXT NOT NULL,
+            repository TEXT,
+            commit_hash TEXT,
+            config_sha256 TEXT,
+            status TEXT NOT NULL DEFAULT 'ok',
+            details TEXT
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_events_operation ON audit_events(operation)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_events_created ON audit_events(created_at)"
+    )
+
+
 #: Ordered list of (version, name, apply_fn).  Versions must be strictly
 #: increasing and gaps are forbidden; add new migrations at the end, never
 #: edit an already-released one.
 MIGRATIONS = [
     (1, 'baseline_schema', _migration_0001_baseline_schema),
+    (2, 'audit_events', _migration_0002_audit_events),
 ]
 
 #: Highest schema version the current tool knows about.
@@ -340,6 +369,97 @@ def get_applied_migrations() -> list:
             "SELECT version, name, applied_at FROM schema_migrations ORDER BY version"
         )
         return cursor.fetchall()
+
+
+# Canonical audit event operations.  Kept as constants so tests and the CLI
+# cannot drift apart on spelling.
+AUDIT_OPERATIONS = (
+    'SCAN_COMPLETED',
+    'OWNERSHIP_ANALYZED',
+    'USED_CODE_MARKED',
+    'USED_CODE_IMPORTED',
+    'USED_CODE_CLEARED',
+    'SPLIT_PLANNED',
+    'ALLOCATION_APPLIED',
+    'WORKSPACE_BUILT',
+    'DUPLICATE_DETECTED',
+    'MATERIAL_GENERATED',
+    'MATERIAL_AUDITED',
+    'PROTECTED_ASSETS_AUDITED',
+    'FINAL_AUDIT',
+)
+
+
+def record_audit_event(operation: str, repository: Optional[str] = None,
+                       commit_hash: Optional[str] = None,
+                       config_sha256: Optional[str] = None,
+                       status: str = 'ok',
+                       details: Optional[dict] = None) -> int:
+    """Append one audit event.  INSERT-only: events are never rewritten.
+
+    Returns the new event id.  ``details`` is stored as JSON text.
+    """
+    import json as _json
+    if details is not None and not isinstance(details, dict):
+        raise TypeError("details must be a dict (stored as JSON)")
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO audit_events
+                (operation, repository, commit_hash, config_sha256, status, details)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                operation,
+                repository,
+                commit_hash,
+                config_sha256,
+                status,
+                _json.dumps(details, ensure_ascii=False) if details is not None else None,
+            ),
+        )
+        return cursor.lastrowid
+
+
+def list_audit_events(limit: int = 50, operation: Optional[str] = None) -> list:
+    """Read recent audit events, newest first.  Read-only view."""
+    import json as _json
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        if operation:
+            cursor.execute(
+                """
+                SELECT id, created_at, operation, repository, commit_hash,
+                       config_sha256, status, details
+                FROM audit_events WHERE operation = ?
+                ORDER BY id DESC LIMIT ?
+                """,
+                (operation, limit),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT id, created_at, operation, repository, commit_hash,
+                       config_sha256, status, details
+                FROM audit_events ORDER BY id DESC LIMIT ?
+                """,
+                (limit,),
+            )
+        rows = cursor.fetchall()
+    events = []
+    for row in rows:
+        events.append({
+            'id': row[0],
+            'created_at': row[1],
+            'operation': row[2],
+            'repository': row[3],
+            'commit_hash': row[4],
+            'config_sha256': row[5],
+            'status': row[6],
+            'details': _json.loads(row[7]) if row[7] else None,
+        })
+    return events
 
 
 def get_or_create_repository(name: str, path: str) -> int:
