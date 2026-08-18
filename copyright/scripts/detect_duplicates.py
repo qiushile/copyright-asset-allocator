@@ -33,8 +33,22 @@ def tokenize_code(code: str) -> list:
     return tokens
 
 
+def _line_at(code: str, index: int) -> int:
+    """1-based line number of character ``index`` in ``code``."""
+    return code.count('\n', 0, index) + 1
+
+
+def _end_line(start_line: int, func_code: str) -> int:
+    """1-based line of the function's last non-blank character."""
+    return start_line + func_code.rstrip().count('\n')
+
+
 def extract_functions(code: str, language: str) -> list:
-    """Extract function-level code blocks."""
+    """Extract function-level code blocks.
+
+    Each block carries 1-based inclusive ``start_line``/``end_line`` so
+    duplicate findings can point a human reviewer at exact locations.
+    """
     functions = []
     
     if language in ('Java', 'JavaScript', 'TypeScript', 'C', 'C++', 'C#', 'Go'):
@@ -56,12 +70,22 @@ def extract_functions(code: str, language: str) -> list:
                         break
             
             func_code = code[start:end]
+            # Optional modifier/return-type prefixes can start matching on
+            # leading whitespace (including the newline of a previous line).
+            # Strip it so reported ranges start at the function's real
+            # first token, not on trailing whitespace of an earlier line.
+            stripped = func_code.lstrip()
+            leading = len(func_code) - len(stripped)
+            func_code = stripped
+            start_line = _line_at(code, start + leading)
             functions.append({
                 'name': match.group(1),
                 'code': func_code,
                 'lines': func_code.count('\n') + 1,
+                'start_line': start_line,
+                'end_line': _end_line(start_line, func_code),
             })
-    
+
     elif language == 'Python':
         # Python: def pattern
         pattern = r'(?:async\s+)?def\s+(\w+)\s*\([^)]*\):'
@@ -75,12 +99,15 @@ def extract_functions(code: str, language: str) -> list:
                 end = len(code)
             
             func_code = code[start:end]
+            start_line = _line_at(code, start)
             functions.append({
                 'name': match.group(1),
                 'code': func_code,
                 'lines': func_code.count('\n') + 1,
+                'start_line': start_line,
+                'end_line': _end_line(start_line, func_code),
             })
-    
+
     return functions
 
 
@@ -174,6 +201,8 @@ def detect_similar_code(files_by_copyright: dict, repo_path: Path) -> list:
                     'file': file['path'],
                     'function': func['name'],
                     'lines': func['lines'],
+                    'start_line': func.get('start_line'),
+                    'end_line': func.get('end_line'),
                 }
         
         fingerprints_by_copyright[cr_id] = fingerprints
@@ -198,9 +227,19 @@ def detect_similar_code(files_by_copyright: dict, repo_path: Path) -> list:
                     f1 = fps1[fp]
                     f2 = fps2[fp]
                     similar_functions.append({
+                        # Legacy keys (kept for compatibility with existing
+                        # reports/tests):
                         'function_1': f"{f1['file']}::{f1['function']}",
                         'function_2': f"{f2['file']}::{f2['function']}",
                         'lines': max(f1['lines'], f2['lines']),
+                        # Reviewer-facing evidence:
+                        'type': 'similar_function',
+                        'file_a': f1['file'],
+                        'file_b': f2['file'],
+                        'function_a': f1['function'],
+                        'function_b': f2['function'],
+                        'lines_a': [f1['start_line'], f1['end_line']],
+                        'lines_b': [f2['start_line'], f2['end_line']],
                     })
                     total_lines += max(f1['lines'], f2['lines'])
                     max_lines = max(max_lines, f1['lines'], f2['lines'])
@@ -318,7 +357,15 @@ def save_report(report: dict, output_path: Path):
                 f.write(f"    相似度: {overlap['similarity_ratio'] * 100:.1f}%\n")
                 
                 for func in overlap['similar_functions'][:5]:
-                    f.write(f"    - {func['function_1']} <-> {func['function_2']} ({func['lines']} 行)\n")
+                    if func.get('lines_a') and func.get('lines_b'):
+                        f.write(
+                            f"    - {func['file_a']}::{func['function_a']} "
+                            f"(行 {func['lines_a'][0]}-{func['lines_a'][1]}) <-> "
+                            f"{func['file_b']}::{func['function_b']} "
+                            f"(行 {func['lines_b'][0]}-{func['lines_b'][1]})\n"
+                        )
+                    else:  # legacy report without ranges
+                        f.write(f"    - {func['function_1']} <-> {func['function_2']} ({func['lines']} 行)\n")
             f.write("\n")
 
 

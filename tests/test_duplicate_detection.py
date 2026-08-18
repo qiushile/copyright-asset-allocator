@@ -16,6 +16,7 @@ from detect_duplicates import (
     detect_path_overlap,
     detect_similar_code,
     extract_functions,
+    extract_functions,
 )
 
 PY_FUNC = '''def process_batch(records):
@@ -137,3 +138,76 @@ class TestSimilarCode:
     def test_short_python_functions_are_extracted_with_names(self):
         functions = extract_functions(PY_FUNC, "Python")
         assert [f["name"] for f in functions] == ["process_batch"]
+
+
+class TestFunctionLineRanges:
+    """Duplicate findings must point at exact file + line ranges."""
+
+    def test_extract_functions_records_one_based_ranges(self):
+        code = (
+            "# header comment\n"          # line 1
+            "\n"                          # line 2
+            "import os\n"                 # line 3
+            "\n"                          # line 4
+            "def alpha(x):\n"             # line 5
+            "    return x + 1\n"          # line 6
+            "\n"                          # line 7
+            "def beta(y):\n"              # line 8
+            "    z = y * 2\n"             # line 9
+            "    return z\n"              # line 10
+        )
+        funcs = extract_functions(code, "Python")
+        assert [f["name"] for f in funcs] == ["alpha", "beta"]
+        assert funcs[0]["start_line"] == 5
+        assert funcs[0]["end_line"] == 6
+        assert funcs[1]["start_line"] == 8
+        assert funcs[1]["end_line"] == 10
+
+    def test_similar_finding_carries_files_and_line_ranges(self, tmp_cwd):
+        shared = (
+            "def process_batch(records):\n"
+            "    results = []\n"
+            "    for record in records:\n"
+            "        if record.is_valid():\n"
+            "            results.append(record.normalize())\n"
+            "    return results\n"
+        )
+        # File A: function starts at line 1.  File B: same function shifted
+        # down by filler lines, so ranges must differ but be correct.
+        (tmp_cwd / "a.py").write_text(shared, encoding="utf-8")
+        (tmp_cwd / "b.py").write_text(
+            "# filler 1\n# filler 2\n# filler 3\n\n" + shared,
+            encoding="utf-8",
+        )
+
+        files_by_copyright = {
+            "alpha": [_file("a.py")],
+            "beta": [_file("b.py")],
+        }
+        pairs = detect_similar_code(files_by_copyright, Path(tmp_cwd))
+        assert len(pairs) == 1
+        finding = pairs[0]["similar_functions"][0]
+
+        # Legacy keys remain intact.
+        assert finding["function_1"].endswith("::process_batch")
+        assert finding["function_2"].endswith("::process_batch")
+
+        # New reviewer-facing evidence.
+        assert finding["type"] == "similar_function"
+        assert finding["file_a"] == "a.py"
+        assert finding["file_b"] == "b.py"
+        assert finding["lines_a"] == [1, 6]
+        assert finding["lines_b"] == [5, 10]
+
+    def test_c_style_function_ranges(self):
+        code = (
+            "// header\n"                       # line 1
+            "int add(int a, int b) {\n"         # line 2
+            "    return a + b;\n"               # line 3
+            "}\n"                               # line 4
+        )
+        funcs = extract_functions(code, "C")
+        assert len(funcs) == 1
+        assert funcs[0]["name"] == "add"
+        assert funcs[0]["start_line"] == 2
+        assert funcs[0]["end_line"] == 4
