@@ -163,7 +163,7 @@ def cmd_allocate(args):
     manifest_config_sha = None
     if not results.get('ambiguous'):
         from run_manifest import write_run_manifest, DEFAULT_CONFIG_PATH, DEFAULT_REQUIREMENTS_PATH
-        from database import get_since_date
+        from database import get_since_date, get_repository_id_for_commit
         manifest = write_run_manifest(
             commit_id=scan_result['commit_id'],
             commit_hash=scan_result['commit_hash'],
@@ -174,7 +174,8 @@ def cmd_allocate(args):
                 'skip_used': not args.no_skip_used,
                 'skip_non_team': not args.no_skip_non_team,
             },
-            since=get_since_date(),
+            since=get_since_date(
+                get_repository_id_for_commit(scan_result['commit_id'])),
         )
         manifest_config_sha = manifest['config']['sha256']
         if args.verbose:
@@ -706,17 +707,19 @@ def cmd_ownership(args):
         repo_path = Path(args.repo_path) if args.repo_path else Path(scan_result.get('repo_path', '.'))
         commit_hash = args.commit_hash if args.commit_hash else scan_result.get('commit_hash', 'HEAD')
         
-        # Handle --since parameter
+        # Handle --since parameter.  The cutoff is stored for the scanned
+        # repository only, so it cannot leak into other repositories.
         from database import set_since_date, get_since_timestamp
+        repository_id = scan_result.get('repository_id')
         since_timestamp = None
         if hasattr(args, 'since') and args.since:
-            set_since_date(args.since)
-            since_timestamp = get_since_timestamp()
+            set_since_date(args.since, repository_id=repository_id)
+            since_timestamp = get_since_timestamp(repository_id)
             if since_timestamp is None:
                 print(f"Error: Invalid date format: {args.since}")
                 sys.exit(1)
         else:
-            since_timestamp = get_since_timestamp()
+            since_timestamp = get_since_timestamp(repository_id)
         
         results = analyze_repository_ownership(
             commit_id=scan_result['commit_id'],
@@ -759,41 +762,122 @@ def cmd_ownership(args):
 # Time Filter: Set Since Date
 # ============================================================
 
+def _resolve_scoped_repository(repo_path):
+    """Resolve --repo-path to a scanned repository record, or exit with help."""
+    from database import find_repository_by_path, list_repositories
+    repo = find_repository_by_path(repo_path)
+    if repo is None:
+        print(f"Error: repository '{repo_path}' has not been scanned yet.")
+        print("Repository-scoped settings only exist for scanned repositories.")
+        known = list_repositories()
+        if known:
+            print("Scanned repositories:")
+            for r in known:
+                print(f"  - {r['name']} ({r['path']})")
+        else:
+            print("No repositories scanned yet. Run: python copyright_cli.py scan <repo_path>")
+        sys.exit(1)
+    return repo
+
+
 def cmd_set_since(args):
-    """Set or show the time cutoff for code eligibility."""
-    from database import init_database, set_since_date, get_since_date, get_since_timestamp
+    """Set or show the time cutoff for code eligibility.
+
+    With --repo-path the cutoff is stored for that repository only
+    (repository-scoped values win over the global one).  Without it the
+    legacy global cutoff is managed, which applies to every repository
+    that has no override of its own.
+    """
+    from database import (
+        init_database, set_since_date, get_since_date, get_since_timestamp,
+        get_repository_setting, list_repositories, list_repository_settings,
+        parse_since_date,
+    )
     from datetime import datetime
-    
+
     init_database()
-    
+
+    repo_path = getattr(args, 'repo_path', None)
+    repository_id = None
+    scope_label = 'global'
+    if repo_path:
+        repo = _resolve_scoped_repository(repo_path)
+        repository_id = repo['id']
+        scope_label = f"repository '{repo['name']}' ({repo['path']})"
+
     if args.action == 'set':
         date_str = args.date
-        # Validate date format
-        set_since_date(date_str)
-        ts = get_since_timestamp()
+        # Validate before storing so an invalid date never persists.
+        ts = parse_since_date(date_str)
         if ts is None:
             print(f"Error: Invalid date format: {date_str}")
             print("Supported: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, YYYY/MM/DD, YYYY-MM")
             sys.exit(1)
+        set_since_date(date_str, repository_id=repository_id)
         dt = datetime.fromtimestamp(ts)
-        print(f"Time filter set: only code after {dt.strftime('%Y-%m-%d %H:%M:%S')} is eligible")
+        print(f"Time filter set ({scope_label}): only code after "
+              f"{dt.strftime('%Y-%m-%d %H:%M:%S')} is eligible")
         print(f"  (Stored: {date_str})")
+        if repository_id is None:
+            repos = list_repositories()
+            if len(repos) > 1:
+                print(f"  Note: this GLOBAL cutoff applies to all {len(repos)} scanned")
+                print("  repositories that have no repository-scoped cutoff of their own.")
+                print("  Use --repo-path <path> to scope the cutoff to one repository.")
         print(f"\nNext: run 'ownership analyze' to re-evaluate file eligibility")
-    
+
     elif args.action == 'show':
-        date_str = get_since_date()
-        if date_str:
-            ts = get_since_timestamp()
-            dt = datetime.fromtimestamp(ts) if ts else None
-            print(f"Current time filter: {date_str}")
-            if dt:
-                print(f"  Parsed as: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+        overrides = list_repository_settings('since_date')
+        if repository_id is not None:
+            scoped = get_repository_setting(repository_id, 'since_date')
+            effective = get_since_date(repository_id)
+            if scoped:
+                ts = parse_since_date(scoped)
+                dt = datetime.fromtimestamp(ts) if ts else None
+                print(f"Repository-scoped time filter ({scope_label}): {scoped}")
+                if dt:
+                    print(f"  Parsed as: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            else:
+                print(f"No repository-scoped time filter for {scope_label}.")
+                if effective:
+                    print(f"  Effective via global fallback: {effective}")
+                else:
+                    print("  No global filter set either. All code is eligible regardless of date.")
+            others = [o for o in overrides if o['repository_id'] != repository_id]
         else:
-            print("No time filter set. All code is eligible regardless of date.")
-    
+            date_str = get_since_date()
+            if date_str:
+                ts = parse_since_date(date_str)
+                dt = datetime.fromtimestamp(ts) if ts else None
+                print(f"Current global time filter: {date_str}")
+                if dt:
+                    print(f"  Parsed as: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            else:
+                print("No global time filter set. All code is eligible regardless of date.")
+            others = overrides
+        if others:
+            print("  Repository-scoped overrides:")
+            for o in others:
+                print(f"    - {o['name']} ({o['path']}): {o['value']}")
+
     elif args.action == 'clear':
-        set_since_date('')
-        print("Time filter cleared. All code is now eligible regardless of date.")
+        set_since_date('', repository_id=repository_id)
+        if repository_id is not None:
+            print(f"Repository-scoped time filter cleared for {scope_label}.")
+            remaining = get_since_date(repository_id)
+            if remaining:
+                print(f"  Global filter still applies: {remaining}")
+            else:
+                print("  All code is now eligible regardless of date.")
+        else:
+            print("Global time filter cleared.")
+            overrides = list_repository_settings('since_date')
+            if overrides:
+                print("  Note: repository-scoped overrides remain in place:")
+                for o in overrides:
+                    print(f"    - {o['name']} ({o['path']}): {o['value']}")
+            else:
+                print("All code is now eligible regardless of date.")
 
 
 # ============================================================
@@ -1090,9 +1174,13 @@ Example workflow:
     
     since_set_parser = set_since_sub.add_parser('set', help='Set the cutoff date')
     since_set_parser.add_argument('date', help='Cutoff date (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)')
-    
-    set_since_sub.add_parser('show', help='Show current time filter')
-    set_since_sub.add_parser('clear', help='Clear time filter')
+    since_set_parser.add_argument('--repo-path', help='Scope the cutoff to one scanned repository')
+
+    since_show_parser = set_since_sub.add_parser('show', help='Show current time filter')
+    since_show_parser.add_argument('--repo-path', help='Show the cutoff for one scanned repository')
+
+    since_clear_parser = set_since_sub.add_parser('clear', help='Clear time filter')
+    since_clear_parser.add_argument('--repo-path', help='Clear only one repository-scoped cutoff')
     
     # auto-split (Feature 3)
     auto_split_parser = subparsers.add_parser('auto-split',

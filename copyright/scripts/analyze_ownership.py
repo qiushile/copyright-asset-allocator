@@ -22,7 +22,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from database import (
     init_database, get_connection,
-    set_since_date, get_since_date, get_since_timestamp
+    set_since_date, get_since_date, get_since_timestamp,
+    get_repository_id_for_commit, parse_since_date,
 )
 
 
@@ -426,8 +427,8 @@ def generate_ownership_report(commit_id: int, output_path: Path):
         """, (commit_id,))
         author_stats = cursor.fetchall()
     
-    # 获取时间过滤设置
-    since_date = get_since_date()
+    # 获取时间过滤设置（按该 commit 所属仓库解析：仓库级优先，全局兜底）
+    since_date = get_since_date(get_repository_id_for_commit(commit_id))
     
     report = {
         'total_files': len(file_stats),
@@ -498,18 +499,19 @@ def main():
             print("Add members with: analyze_ownership.py add-member --name X --email Y")
             sys.exit(1)
         
-        # 解析时间过滤
+        # 解析时间过滤（按 commit 所属仓库作用域保存/读取，避免跨仓库泄漏）
+        repository_id = get_repository_id_for_commit(args.commit_id)
         since_timestamp = None
         if args.since:
-            set_since_date(args.since)
-            since_timestamp = get_since_timestamp()
-            if since_timestamp is None:
+            if parse_since_date(args.since) is None:
                 print(f"Error: Invalid date format: {args.since}")
                 print("Supported formats: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, YYYY/MM/DD")
                 sys.exit(1)
+            set_since_date(args.since, repository_id=repository_id)
+            since_timestamp = get_since_timestamp(repository_id)
         else:
             # 使用已保存的设置
-            since_timestamp = get_since_timestamp()
+            since_timestamp = get_since_timestamp(repository_id)
         
         results = analyze_repository_ownership(
             commit_id=args.commit_id,

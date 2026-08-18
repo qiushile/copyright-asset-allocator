@@ -199,6 +199,15 @@ def _migration_0001_baseline_schema(cursor):
     """)
 
     # 团队人员表（功能2）
+    #
+    # Design decision (task book §9.2): team_members is GLOBAL, not
+    # repository-scoped.  Team membership describes people, not projects:
+    # the same developers typically own every repository this tool scans,
+    # and eligibility is still decided per commit via git-blame evidence
+    # (file_team_stats), so a shared roster cannot leak allocation state
+    # between repositories.  If per-repo rosters ever become necessary,
+    # add a migration with a nullable repository_id column (NULL = global)
+    # rather than breaking this table.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS team_members (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -242,7 +251,7 @@ def _migration_0001_baseline_schema(cursor):
         )
     """)
 
-    # 项目设置表（全局设置；仓库级设置见 repository_settings，migration 0004）
+    # 项目设置表（全局设置；仓库级设置见 repository_settings，migration 0003）
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS project_settings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -294,12 +303,37 @@ def _migration_0002_audit_events(cursor):
     )
 
 
+def _migration_0003_repository_settings(cursor):
+    """Repository-scoped settings (e.g. a per-repository since_date).
+
+    Global settings stay in project_settings.  A repository-scoped value
+    wins over the global one when both exist, so two repositories can
+    carry different time cutoffs without leaking into each other.
+    """
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS repository_settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            repository_id INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (repository_id) REFERENCES repositories(id),
+            UNIQUE(repository_id, key)
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_repository_settings_key"
+        " ON repository_settings(key)"
+    )
+
+
 #: Ordered list of (version, name, apply_fn).  Versions must be strictly
 #: increasing and gaps are forbidden; add new migrations at the end, never
 #: edit an already-released one.
 MIGRATIONS = [
     (1, 'baseline_schema', _migration_0001_baseline_schema),
     (2, 'audit_events', _migration_0002_audit_events),
+    (3, 'repository_settings', _migration_0003_repository_settings),
 ]
 
 #: Highest schema version the current tool knows about.
@@ -750,38 +784,155 @@ def get_project_setting(key: str) -> Optional[str]:
         return row[0] if row else None
 
 
-def set_since_date(date_str: str):
-    """Set the time cutoff date for code eligibility."""
-    set_project_setting('since_date', date_str)
+def set_repository_setting(repository_id: int, key: str, value: str):
+    """Set a repository-scoped setting (upsert per repository + key)."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO repository_settings (repository_id, key, value, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(repository_id, key) DO UPDATE SET
+                value = excluded.value, updated_at = CURRENT_TIMESTAMP
+        """, (repository_id, key, value))
 
 
-def get_since_date() -> Optional[str]:
-    """Get the time cutoff date."""
-    return get_project_setting('since_date')
+def get_repository_setting(repository_id: int, key: str) -> Optional[str]:
+    """Get a repository-scoped setting, or None if not set."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT value FROM repository_settings
+            WHERE repository_id = ? AND key = ?
+        """, (repository_id, key))
+        row = cursor.fetchone()
+        return row[0] if row else None
 
 
-def get_since_timestamp() -> Optional[int]:
-    """Get the time cutoff as Unix timestamp. Returns None if not set."""
-    date_str = get_since_date()
+def clear_repository_setting(repository_id: int, key: str):
+    """Remove a repository-scoped override so global settings apply again."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            DELETE FROM repository_settings
+            WHERE repository_id = ? AND key = ?
+        """, (repository_id, key))
+
+
+def list_repository_settings(key: str) -> list:
+    """All repository-scoped values for ``key``.
+
+    Returns [{'repository_id', 'name', 'path', 'value'}] ordered by
+    repository id, joined with repositories for human-readable output.
+    """
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT rs.repository_id, r.name, r.path, rs.value
+            FROM repository_settings rs
+            JOIN repositories r ON r.id = rs.repository_id
+            WHERE rs.key = ?
+            ORDER BY rs.repository_id
+        """, (key,))
+        return [{'repository_id': row[0], 'name': row[1],
+                 'path': row[2], 'value': row[3]}
+                for row in cursor.fetchall()]
+
+
+def list_repositories() -> list:
+    """All scanned repositories as [{'id', 'name', 'path'}], by id."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, path FROM repositories ORDER BY id")
+        return [{'id': row[0], 'name': row[1], 'path': row[2]}
+                for row in cursor.fetchall()]
+
+
+def find_repository_by_path(path) -> Optional[dict]:
+    """Find a scanned repository whose registered path matches ``path``.
+
+    Comparison happens on resolved absolute paths, so relative spellings
+    (e.g. a '.' stored by scanning from inside the repo) still match.
+    """
+    try:
+        target = str(Path(str(path)).resolve())
+    except OSError:
+        return None
+    for repo in list_repositories():
+        try:
+            if str(Path(repo['path']).resolve()) == target:
+                return repo
+        except OSError:
+            continue
+    return None
+
+
+def get_repository_id_for_commit(commit_id: int) -> Optional[int]:
+    """Resolve which repository a commit belongs to (for scoped settings)."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT repository_id FROM commits WHERE id = ?", (commit_id,))
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+
+def parse_since_date(date_str: str) -> Optional[int]:
+    """Parse a cutoff date string into a Unix timestamp, or None if invalid."""
     if not date_str:
         return None
     from datetime import datetime
-    try:
-        # Support multiple formats
-        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%Y-%m'):
-            try:
-                dt = datetime.strptime(date_str, fmt)
-                return int(dt.timestamp())
-            except ValueError:
-                continue
-        return None
-    except Exception:
-        return None
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d', '%Y-%m'):
+        try:
+            return int(datetime.strptime(date_str, fmt).timestamp())
+        except ValueError:
+            continue
+    return None
+
+
+def set_since_date(date_str: str, repository_id: Optional[int] = None):
+    """Set the time cutoff date for code eligibility.
+
+    With ``repository_id`` the cutoff applies to that repository only; an
+    empty value removes the repository override (restoring any global
+    fallback).  Without it, the legacy global setting is written, which
+    applies to every repository that has no override of its own.
+    """
+    if repository_id is not None:
+        if date_str:
+            set_repository_setting(repository_id, 'since_date', date_str)
+        else:
+            clear_repository_setting(repository_id, 'since_date')
+    else:
+        set_project_setting('since_date', date_str)
+
+
+def get_since_date(repository_id: Optional[int] = None) -> Optional[str]:
+    """Get the time cutoff date.
+
+    A repository-scoped value wins over the global one; an absent or empty
+    repository value falls back to the global setting.
+    """
+    if repository_id is not None:
+        value = get_repository_setting(repository_id, 'since_date')
+        if value:
+            return value
+    return get_project_setting('since_date')
+
+
+def get_since_timestamp(repository_id: Optional[int] = None) -> Optional[int]:
+    """Get the time cutoff as Unix timestamp. Returns None if not set."""
+    return parse_since_date(get_since_date(repository_id))
 
 
 def get_time_eligible_file_ids(commit_id: int) -> Optional[set]:
-    """Get file IDs eligible by time filter. Returns None if no time filter set."""
-    since_ts = get_since_timestamp()
+    """Get file IDs eligible by time filter. Returns None if no time filter set.
+
+    The cutoff is resolved for the repository that owns ``commit_id``
+    (repository-scoped since_date wins, global fallback), so a cutoff set
+    for one repository never filters another repository's commits.
+    """
+    repository_id = get_repository_id_for_commit(commit_id)
+    since_ts = get_since_timestamp(repository_id)
     if since_ts is None:
         return None
     
