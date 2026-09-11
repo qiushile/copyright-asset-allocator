@@ -33,6 +33,7 @@ jobs:
       - name: Run core engine tests
         run: >
           pytest tests/ -q
+          --ignore=tests/test_material_images.py
           --ignore=tests/test_material_documents.py
           --ignore=tests/test_material_audit.py
           --ignore=tests/test_cli_material_commands.py
@@ -67,6 +68,7 @@ jobs:
       - name: Run material generation and rendered-audit tests
         run: >
           pytest -q
+          tests/test_material_images.py
           tests/test_material_documents.py
           tests/test_material_audit.py
           tests/test_cli_material_commands.py

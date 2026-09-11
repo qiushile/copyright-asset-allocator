@@ -25,6 +25,14 @@ program_material:
     minimum_rendered_point_size: 8.0
 
 document_material:
+  images:
+    # 0 preserves existing text-only materials. For a returned application,
+    # set minimum_count / minimum_real_captures to the actual review requirement.
+    minimum_count: 0
+    minimum_real_captures: 0
+    max_per_page: 1
+    caption_counts_as_body_line: false
+    local_evidence_required: true
   lines_per_page: 30
   effective_lines_only: true
   blank_lines_count: false

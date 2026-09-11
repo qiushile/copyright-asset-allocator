@@ -34,6 +34,8 @@ from generate_docx import (
 )
 from material_requirements import load_material_requirements
 from validate_materials import audit_pdf
+from material_images import (load_images, plan_images, check_image_policy,
+                             package_images, publish_image_assets, write_image_manifest)
 
 
 PAGE_CSS = """
@@ -91,6 +93,10 @@ body {
 }
 .row { white-space: nowrap; height: 2.28em; }
 .heading { font-weight: 700; color: #17324d; }
+.with-image .row { line-height: 1.5; height: 1.5em; }
+figure { margin: 8pt 0 0; text-align: center; break-inside: avoid; }
+figure img { display: block; margin: 0 auto; }
+figcaption { line-height: 1.35; margin-top: 5pt; white-space: nowrap; }
 """
 
 
@@ -99,8 +105,11 @@ def _manual_path(workspace_dir: Path, manifest: dict, explicit: Path | None) -> 
     candidates = [
         explicit,
         workspace_dir / 'SOFTWARE_MANUAL.md',
+        workspace_dir.parents[1] / 'manuals' / copyright_id / 'SOFTWARE_MANUAL.md',
         workspace_dir.parents[1] / 'manuals' / f'{copyright_id}.md',
     ]
+    if explicit is not None and not explicit.is_file():
+        raise FileNotFoundError(f'指定说明书不存在：{explicit}')
     selected = next(
         (Path(path) for path in candidates if path and Path(path).is_file()),
         None,
@@ -130,9 +139,10 @@ def _display_manual_row(row: str) -> tuple[str, bool]:
     return text, is_heading
 
 
-def _rows_html(pages: list[list[str]], material_type: str) -> str:
+def _rows_html(pages: list[list[str]], material_type: str, images: list[dict] | None = None) -> str:
     page_fragments = []
-    for page in pages:
+    by_page = {entry['pdf_page']: entry for entry in images or [] if entry['pdf_page']}
+    for page_number, page in enumerate(pages, 1):
         rows = []
         for row in page:
             if material_type == 'document':
@@ -142,7 +152,23 @@ def _rows_html(pages: list[list[str]], material_type: str) -> str:
                 display = row
                 css_class = 'row'
             rows.append(f'<div class="{css_class}">{html.escape(display)}</div>')
-        page_fragments.append('<section class="material-page">' + ''.join(rows) + '</section>')
+        entry = by_page.get(page_number)
+        figure = ''
+        if entry:
+            # 30 * 10.15 * 1.5pt leaves >280pt; reserve caption, margins and slack.
+            scale = min(510 / entry['width_px'], 240 / entry['height_px'])
+            width, height = entry['width_px'] * scale, entry['height_px'] * scale
+            if min(width, height) * 25.4 / 72 < 20 or 72 / scale < 100:
+                raise ValueError('图片打印后过窄或分辨率不足，请裁剪重点区域或提供更高分辨率图片')
+            entry['print_width_mm'] = round(width * 25.4 / 72, 2)
+            entry['print_height_mm'] = round(height * 25.4 / 72, 2)
+            if len(entry['caption']) > 45:
+                raise ValueError('图注过长，请控制在45个字符以内，将详细说明放入正文')
+            figure = (f'<figure><img src="{html.escape(entry["file"], quote=True)}" '
+                      f'style="width:{width:.4f}pt;height:{height:.4f}pt">'
+                      f'<figcaption>{html.escape(entry["caption"])}</figcaption></figure>')
+        css_class = 'material-page with-image' if entry else 'material-page'
+        page_fragments.append(f'<section class="{css_class}">' + ''.join(rows) + figure + '</section>')
     return ''.join(page_fragments)
 
 
@@ -152,8 +178,11 @@ def render_rows_pdf(
     material_type: str,
     software_name: str,
     requirements: dict | None = None,
+    images: list[dict] | None = None,
 ) -> dict:
     rules = requirements or MATERIAL_REQUIREMENTS
+    if material_type == 'document':
+        check_image_policy(images or [], rules)
     lines_per_page = LINES_PER_PAGE if material_type == 'program' else DOC_LINES_PER_PAGE
     font_size = PROGRAM_FONT_SIZE if material_type == 'program' else DOCUMENT_FONT_SIZE
     pages = paginate_lines(rows, lines_per_page)
@@ -168,7 +197,7 @@ def render_rows_pdf(
     )
     document = f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><style>{css}</style></head>
-<body>{_rows_html(pages, material_type)}</body></html>"""
+<body>{_rows_html(pages, material_type, images)}</body></html>"""
     rendered = HTML(string=document, base_url=str(output_path.parent)).render()
     if len(rendered.pages) != TOTAL_PAGES:
         raise ValueError(
@@ -176,7 +205,7 @@ def render_rows_pdf(
             '请检查字号、行宽或分页样式'
         )
     rendered.write_pdf(str(output_path))
-    report = audit_pdf(output_path, material_type, rules)
+    report = audit_pdf(output_path, material_type, rules, expected_images=images)
     if not report['passed']:
         messages = '；'.join(issue['message'] for issue in report['issues'][:10])
         raise ValueError(f'最终PDF未通过复核：{messages}')
@@ -287,24 +316,29 @@ def generate_document_markdown_pdf(
     with tempfile.TemporaryDirectory(prefix='.document-material-', dir=output_dir) as stage:
         staged_markdown = Path(stage) / markdown_path.name
         staged_pdf = Path(stage) / pdf_path.name
-        staged_markdown.write_text(
-            '\n'.join(full_lines).rstrip() + '\n',
-            encoding='utf-8',
-        )
+        images = load_images(selected_manual, full_lines)
+        full_lines, images = package_images(selected_manual, full_lines, images, Path(stage))
+        staged_markdown.write_text('\n'.join(full_lines).rstrip() + '\n', encoding='utf-8')
+        images = load_images(staged_markdown, full_lines)
         rendered_markdown = staged_markdown.read_text(encoding='utf-8')
         _validate_manual_source(staged_markdown, rendered_markdown)
-        normalized_rows = _normalize_document_rows(rendered_markdown.splitlines())
+        normalized_rows, images = plan_images(full_lines, images, _normalize_document_rows)
         _validate_document_content(normalized_rows)
+        check_image_policy(images, rules)
         selected_rows = select_material_rows(normalized_rows, DOC_LINES_PER_PAGE)
-        render_rows_pdf(
-            selected_rows,
-            staged_pdf,
-            'document',
-            software_name,
-            rules,
-        )
+        render_rows_pdf(selected_rows, staged_pdf, 'document', software_name, rules, images=images)
+        write_image_manifest(Path(stage), images)
+        # Recheck the frozen boundary immediately before publishing the staged bundle.
+        _assert_generation_target(manifest, output_dir, software_name, rules)
+        publish_image_assets(Path(stage), output_dir)
+        sidecar = Path(stage) / '软件说明书.images.yaml'
+        if sidecar.exists():
+            sidecar.replace(output_dir / sidecar.name)
+        elif (output_dir / '软件说明书.images.yaml').exists():
+            (output_dir / '软件说明书.images.yaml').unlink()
         staged_markdown.replace(markdown_path)
         staged_pdf.replace(pdf_path)
+        (Path(stage) / '软件说明书-图片清单.json').replace(output_dir / '软件说明书-图片清单.json')
     return markdown_path, pdf_path
 
 

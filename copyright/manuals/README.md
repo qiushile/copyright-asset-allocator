@@ -53,3 +53,11 @@
 python copyright_cli.py generate <copyright-id> --manual copyright/manuals/<copyright-id>.md
 python copyright_cli.py material-audit copyright/outputs/<copyright-id>
 ```
+
+## 4. 插入图片
+
+现在支持独占一行的 `![图注](assets/图片.png)` 和同目录 `images.yaml` 来源清单。
+图片及图注均不计入每页30行正文；每页最多一张图，等比缩放。生成时会打包图片和证据，
+独立审计检查摘要、实际PDF图片、图注及重叠情况。HTML截图可用于明确标注的源码示意图；
+真实运行截图需来自真实系统。完整操作、采集脚本及示例见
+[说明书图片工作流](../../docs/document-images.md)。

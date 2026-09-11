@@ -454,6 +454,8 @@ def generate_doc_material(
         )
     manual_text = selected_manual.read_text(encoding='utf-8', errors='ignore')
     _validate_manual_source(selected_manual, manual_text)
+    if '![' in manual_text or '<img' in manual_text.lower():
+        raise ValueError('含图片的说明书请使用 generate_markdown_pdf.py 的 Markdown -> PDF 主流程')
     doc_lines = manual_text.splitlines()
 
     # 合并已验证的材料元数据与人工核实的系统专用说明书。

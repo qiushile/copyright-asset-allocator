@@ -16,6 +16,7 @@ from docx import Document
 from pypdf import PdfReader
 
 from material_requirements import load_material_requirements
+from material_images import load_images, plan_images, check_image_policy, sha256
 
 
 A4_WIDTH_PT = 595.276
@@ -53,11 +54,12 @@ def classify_material(path: Path) -> str | None:
     return None
 
 
-def _body_top_values(page: pdfplumber.page.Page) -> set[float]:
+def _body_top_values(page: pdfplumber.page.Page, caption_tops: set[float] | None = None) -> set[float]:
     return {
         round(float(word["top"]), 1)
         for word in page.extract_words()
         if 40 < float(word["top"]) < float(page.height) - 45
+        and round(float(word["top"]), 1) not in (caption_tops or set())
     }
 
 
@@ -92,6 +94,7 @@ def audit_pdf(
     path: Path,
     material_type: str,
     requirements: dict[str, Any],
+    expected_images: list[dict] | None = None,
 ) -> dict[str, Any]:
     selection = requirements["page_selection"]
     policy = (
@@ -102,6 +105,18 @@ def audit_pdf(
     expected_pages = int(selection["total_pages"])
     expected_rows = int(policy["lines_per_page"])
     issues: list[dict[str, Any]] = []
+
+    image_entries = expected_images
+    if material_type == 'document':
+        try:
+            if image_entries is None:
+                image_entries = _load_pdf_image_plan(path)
+            check_image_policy(image_entries, requirements)
+        except Exception as exc:
+            issues.append(_error('image_evidence', str(exc), path))
+            image_entries = []
+    by_page = {entry['pdf_page']: entry for entry in image_entries or [] if entry['pdf_page']}
+    image_count = 0
 
     reader = PdfReader(str(path))
     page_count = len(reader.pages)
@@ -135,7 +150,13 @@ def audit_pdf(
     minimum_font_sizes: list[float] = []
     with pdfplumber.open(path) as document:
         for page_number, page in enumerate(document.pages, start=1):
-            row_count = len(_body_top_values(page))
+            caption_tops = set()
+            if material_type == 'document':
+                entry = by_page.get(page_number)
+                image_count += len(page.images)
+                image_issues, caption_tops = _audit_page_image(page, entry, path, page_number)
+                issues.extend(image_issues)
+            row_count = len(_body_top_values(page, caption_tops))
             row_counts.append(row_count)
             if row_count < expected_rows:
                 issues.append(
@@ -182,6 +203,7 @@ def audit_pdf(
         "format": "pdf",
         "material_type": material_type,
         "page_count": page_count,
+        "image_count": image_count,
         "minimum_body_rows": min(row_counts) if row_counts else 0,
         "maximum_body_rows": max(row_counts) if row_counts else 0,
         "minimum_body_font_size": (
@@ -190,6 +212,58 @@ def audit_pdf(
         "passed": not any(issue["severity"] == "error" for issue in issues),
         "issues": issues,
     }
+
+
+def _load_pdf_image_plan(path: Path) -> list[dict]:
+    manual = path.with_suffix('.md')
+    manifest_path = path.with_name(path.stem + '-图片清单.json')
+    if not manual.exists():
+        if manifest_path.exists():
+            raise ValueError('图片清单存在但缺少对应Markdown')
+        return []
+    lines = manual.read_text(encoding='utf-8').splitlines()
+    images = load_images(manual, lines)
+    if not images and not manifest_path.exists():
+        return []  # Legacy text-only material remains supported.
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    if manifest.get('schema_version') != 1:
+        raise ValueError('不支持的图片清单版本')
+    if manifest.get('pdf_sha256') != sha256(path) or manifest.get('markdown_sha256') != sha256(manual):
+        raise ValueError('PDF或Markdown与图片清单摘要不一致，请重新生成并审计')
+    # Lazy import keeps the legacy DOCX/Markdown validators free of an import cycle.
+    from generate_docx import _normalize_document_rows
+    _, planned = plan_images(lines, images, _normalize_document_rows)
+    recorded = manifest.get('images', [])
+    keys = ('id', 'file', 'caption', 'source_type', 'sha256', 'evidence',
+            'width_px', 'height_px', 'anchor_row', 'pdf_page')
+    if [{k: e.get(k) for k in keys} for e in planned] != [{k: e.get(k) for k in keys} for e in recorded]:
+        raise ValueError('图片清单与Markdown、证据或实际分页计划不一致')
+    return recorded
+
+
+def _audit_page_image(page, entry: dict | None, path: Path, number: int) -> tuple[list[dict], set[float]]:
+    issues, caption_tops = [], set()
+    expected = 1 if entry else 0
+    if len(page.images) != expected:
+        issues.append(_error('image_count', f'第{number}页应有{expected}张图片，实际{len(page.images)}张', path, page=number))
+    for img in page.images:
+        x0, top, x1, bottom = (float(img[k]) for k in ('x0', 'top', 'x1', 'bottom'))
+        if x0 < 42 or x1 > page.width - 42 or top < 50 or bottom > page.height - 50:
+            issues.append(_error('image_bounds', f'第{number}页图片超出正文区域', path, page=number))
+        if any(c.get('text', '').strip() and min(x1, c['x1']) - max(x0, c['x0']) > 0.5
+               and min(bottom, c['bottom']) - max(top, c['top']) > 0.5 for c in page.chars):
+            issues.append(_error('image_overlap', f'第{number}页图片与文字重叠', path, page=number))
+        if entry:
+            width_mm, height_mm = (x1-x0)*25.4/72, (bottom-top)*25.4/72
+            if abs(width_mm - entry.get('print_width_mm', 0)) > 0.2 or abs(height_mm - entry.get('print_height_mm', 0)) > 0.2:
+                issues.append(_error('image_dimensions', f'第{number}页图片打印尺寸与清单不一致', path, page=number))
+            # Caption is separately checked and excluded from the 30 body rows.
+            caption_words = [w for w in page.extract_words() if bottom <= float(w['top']) <= bottom + 25]
+            caption_tops.update(round(float(w['top']), 1) for w in caption_words)
+            caption = ''.join(w['text'] for w in sorted(caption_words, key=lambda w: (round(w['top'], 1), w['x0'])))
+            if re.sub(r'\s+', '', entry['caption']) != re.sub(r'\s+', '', caption):
+                issues.append(_error('image_caption', f'第{number}页缺少对应图注或图注被裁切', path, page=number))
+    return issues, caption_tops
 
 
 def split_docx_pages(document: Document) -> list[list[str]]:
@@ -415,6 +489,10 @@ def audit_markdown(path: Path, requirements: dict[str, Any]) -> dict[str, Any]:
                 )
 
     if material_type == "document" or "软件说明书" in path.stem:
+        try:
+            metrics['source_image_count'] = len(load_images(path, text.splitlines()))
+        except Exception as exc:
+            issues.append(_error('image_evidence', str(exc), path))
         rule = requirements["document_material"]["supplemental_operation_tips"]
         section = _extract_markdown_tail(text, rule["heading"])
         if section is None:

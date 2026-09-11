@@ -15,6 +15,10 @@ pdfplumber>=0.11.0
 
 # Markdown -> PDF generation
 weasyprint>=66.0
+Pillow>=10.0
+
+# Optional HTML/web screenshots: pip install playwright && playwright install chromium
+# Mirrored in pyproject.toml optional-dependencies.capture.
 
 # Optional: Code parsing for better function extraction
 # tree-sitter>=0.20.0

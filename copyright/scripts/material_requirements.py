@@ -123,6 +123,17 @@ def validate_requirement_config(requirements: dict[str, Any]) -> None:
             errors.append(f"{label}鉴别材料字号策略必须为不增页前提下最大化")
         if float(font.get("generation_point_size", 0)) != expected:
             errors.append(f"{label}鉴别材料生成字号必须为{expected:g}磅")
+    images = document.get('images', {})
+    if not isinstance(images, dict):
+        errors.append('document_material.images 必须为对象')
+    else:
+        for key in ('minimum_count', 'minimum_real_captures'):
+            value = images.get(key, 0)
+            if type(value) is not int or not 0 <= value <= 60:
+                errors.append(f'images.{key} 必须为0至60的整数')
+        if images.get('max_per_page', 1) != 1 or images.get('caption_counts_as_body_line', False) is not False or images.get('local_evidence_required', True) is not True:
+            errors.append('图片须每页最多1张、图注不计正文行且必须有本地证据')
+
     for item in requirements.get("protected_assets", []):
         if item.get("immutable") is not True:
             errors.append(f"冻结项 {item.get('copyright_id', '?')} 必须设置 immutable: true")
