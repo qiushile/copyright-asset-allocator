@@ -143,12 +143,29 @@ document_material:
 
 保留规则文件其他字段。生成与审计需使用同一份规则（CLI的 `--requirements` 参数），不要只改审计。默认两项数量都为0，兼容既有纯文本材料；图片被裁切掉不计数。
 
-## 运行本仓库示例
+## 运行本仓库 HTML demo
 
 ```bash
+# 完整生成：离线HTML → Chromium截图 → 单页PDF → 版式检查
 .venv/bin/python docs/examples/render_image_example.py
+
+# 只生成离线HTML、源码清单和快照，不需要Playwright/WeasyPrint
+.venv/bin/python docs/examples/render_image_example.py --html-only
+
+# 指定新的输出目录；已有目录始终拒绝覆盖
+.venv/bin/python docs/examples/render_image_example.py --output /tmp/materials-demo
 ```
 
-从当前三个图片处理模块的AST提取函数和静态依赖，生成自包含HTML，经Chromium截图，插入单页PDF并检查30行正文、图注和图文边界。输出在 `copyright/outputs/image-example/`，该目录须尚不存在。也可指定新的 `--output`。
+默认输出为 `copyright/outputs/html-demos/<时间戳>/`，可以反复运行。命令完成后打印实际HTML路径；完整模式还会打印PDF路径。支持 `--requirements` 指定冻结规则。浏览器依赖缺失或渲染失败时不发布半成品；安装可选依赖后可以重试同一个尚未创建的目标目录。
 
-`图片排版预览.pdf`是单页排版演示，**不是申报说明书**。60页、前后裁切、完整生成、搬迁后审计、篡改失败等由 `tests/test_material_images.py` 中明确标注的测试夹具验证。实际业务补图仍需对应系统的说明书、真实截图和补正意见。
+生成内容：
+
+- `source-inventory.html`：自包含离线页面，无需服务器或CDN。上方为适合截图的中文模块概览，下方展示全部顶层函数，支持关键词搜索、模块筛选、空结果恢复及源码清单下载；手机上采用单列布局。
+- `source-inventory.json`：由AST提取的函数名、同步/异步类型、源码行范围、docstring、顶层静态导入和每个文件的SHA-256。Git版本仅为参考，实际统计来自工作区快照。
+- `sources/*.py`：生成时读取并归档的原始源码，HTML可直接下载。源码仅做静态解析，不执行。
+- `bundle/`：完整模式生成的截图和证据包。截图只截取 `#diagram` 概览，避免将完整函数表缩成难以辨认的小图；证据包含同一份源码快照和JSON清单。
+- `图片排版预览.pdf`、`preview-verification.json`：完整模式的单页预览及30行正文、图注、图文边界、字号检查结果。
+
+生成器与页面模板分离：修改 `docs/examples/source_inventory.html` 可调整视觉样式及交互；`docs/examples/render_image_example.py` 负责采集快照、生成内容和输出检查。概览中的职责文字是针对本项目人工整理的说明，函数及依赖数据来自源码；AST只统计顶层函数和导入，不表示运行时调用顺序，也不包含类方法、嵌套函数和动态导入。
+
+`图片排版预览.pdf`是单页排版演示，**不是申报说明书**。60页、前后裁切、完整生成、搬迁后审计、篡改失败等由 `tests/test_material_images.py` 中明确标注的测试夹具验证；`tests/test_html_demo.py` 验证源码快照、HTML转义、只生成HTML、失败清理和冻结保护。实际业务补图仍需对应系统的说明书、真实截图和补正意见。
